@@ -15,7 +15,7 @@ use std::{
 use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_core::{
-    Client, ClientBuilder, ClientSettings, DeviceType, OrganizationId,
+    ApiError, Client, ClientBuilder, ClientSettings, DeviceType, OrganizationId,
     auth::{AuthRequestResponse, JwtToken, login::TwoFactorEmailRequest},
     client::{
         login_method::UserLoginMethod,
@@ -32,8 +32,16 @@ use bitwarden_crypto::{
     derive_symmetric_key_from_prf, safe::PasswordProtectedKeyEnvelope,
 };
 use bitwarden_crypto_sync_handler::CryptoSyncData;
+use bitwarden_generators::{
+    GeneratorClientsExt, MAXIMUM_MIN_CHAR_COUNT, MAXIMUM_PASSPHRASE_NUM_WORDS, MAXIMUM_PASSWORD_LENGTH,
+    MINIMUM_PASSPHRASE_NUM_WORDS, MINIMUM_PASSWORD_LENGTH, PassphraseGeneratorRequest, PasswordGeneratorRequest,
+};
 use bitwarden_sync::{SyncClientExt, SyncHandler, SyncHandlerError, SyncRequest};
-use bitwarden_vault::{Cipher, CipherType, CipherView, UriMatchType, VaultClientExt, generate_totp};
+use bitwarden_vault::{
+    CardView, Cipher, CipherCreateRequest, CipherEditRequest, CipherId, CipherRepromptType, CipherType, CipherView,
+    CipherViewType, CreateCipherError, EditCipherError, IdentityView, LoginUriView, LoginView, UriMatchType,
+    VaultClientExt, generate_totp,
+};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -274,25 +282,54 @@ pub enum Unlock<'a> {
     },
 }
 
-/// The values of one login for a fill or a copy. Zeroed when dropped.
+/// The values of one item for a fill or a copy: each asked field that the item has, by its protocol name ("totp" is
+/// the current code of a login's TOTP key). Zeroed when dropped.
 #[derive(Default)]
-pub struct Values {
-    pub username: Option<String>,
-    pub password: Option<String>,
-    /// The current code of the login's TOTP key.
-    pub totp: Option<String>,
-}
+pub struct Values(pub Vec<(String, String)>);
 
 impl Drop for Values {
     fn drop(&mut self) {
-        for v in [&mut self.username, &mut self.password, &mut self.totp]
-            .into_iter()
-            .flatten()
-        {
+        for (_, v) in &mut self.0 {
             v.zeroize();
         }
     }
 }
+
+/// One `save`: a new login (`item` "") or the changes to an existing one ("" leaves a field as it is).
+#[derive(Clone, Copy, Default)]
+pub struct SaveRequest<'a> {
+    pub item: &'a str,
+    pub name: &'a str,
+    /// The page's address ("" = none).
+    pub uri: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+/// One `generate`: a password or a passphrase. A field at 0, "" or false takes its default; a password with no
+/// character class asks for all four.
+#[derive(Clone, Default)]
+pub struct Generate {
+    /// "password" or "passphrase".
+    pub kind: String,
+    pub length: u32,
+    pub uppercase: bool,
+    pub lowercase: bool,
+    pub numbers: bool,
+    pub special: bool,
+    pub min_numbers: u32,
+    pub min_special: u32,
+    pub words: u32,
+    pub separator: String,
+    pub capitalize: bool,
+    pub include_number: bool,
+}
+
+/// The length of a password when the browser names none: longer than the SDK's 16, because nobody types it.
+pub const PASSWORD_LENGTH: u32 = 20;
+/// The words of a passphrase when the browser names none.
+pub const PASSPHRASE_WORDS: u32 = 5;
+pub const PASSPHRASE_SEPARATOR: &str = "-";
 
 /// A TOTP code and how long it stays valid.
 pub struct Code {
@@ -1381,7 +1418,7 @@ impl Session {
         Ok(())
     }
 
-    /// The decrypted login items, then dropped by the caller.
+    /// The decrypted items that the browser lists (logins, cards, identities), then dropped by the caller.
     async fn views(&self) -> Result<Vec<CipherView>, Failure> {
         let client = self.client.as_ref().ok_or_else(locked)?;
         let result = client
@@ -1389,11 +1426,7 @@ impl Session {
             .ciphers()
             .decrypt_list_full_with_failures(self.ciphers.clone())
             .await;
-        Ok(result
-            .successes
-            .into_iter()
-            .filter(|v| v.deleted_date.is_none() && matches!(v.r#type, CipherType::Login) && v.login.is_some())
-            .collect())
+        Ok(result.successes.into_iter().filter(listed).collect())
     }
 
     /// The domains equivalent to a page's registrable domain (`matching::equivalent_of` over the account's groups).
@@ -1406,6 +1439,9 @@ impl Session {
     pub async fn logins_for(&self, page: &Page<'_>) -> Result<Vec<Row>, Failure> {
         let mut rows = Vec::new();
         for view in self.views().await? {
+            if !matches!(view.r#type, CipherType::Login) {
+                continue;
+            }
             let Some(id) = view.id.map(|i| i.to_string()) else {
                 continue;
             };
@@ -1426,6 +1462,7 @@ impl Session {
                     uri,
                     matched: how,
                     has_totp: login.totp.is_some(),
+                    kind: "login",
                 });
             }
         }
@@ -1433,8 +1470,9 @@ impl Session {
         Ok(rows)
     }
 
-    /// `search`: the logins whose name, user name or addresses hold every word of `query`, sorted by name, at most
-    /// `limit` (0 or more than `SEARCH_LIMIT`: `SEARCH_LIMIT`). No password.
+    /// `search`: the logins, cards and identities whose name, user name (a card's brand and last digits, an identity's
+    /// name or email) or addresses hold every word of `query`, sorted by name, at most `limit` (0 or more than
+    /// `SEARCH_LIMIT`: `SEARCH_LIMIT`). No password, no card number.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Row>, Failure> {
         let limit = if limit == 0 {
             SEARCH_LIMIT
@@ -1446,9 +1484,16 @@ impl Session {
             let Some(id) = view.id.map(|i| i.to_string()) else {
                 continue;
             };
-            let Some(login) = &view.login else { continue };
-            let uris: Vec<&str> = login.uris.iter().flatten().filter_map(|u| u.uri.as_deref()).collect();
-            let username = login.username.clone().unwrap_or_default();
+            let Some((kind, username)) = summary(&view) else {
+                continue;
+            };
+            let login = view.login.as_ref().filter(|_| kind == "login");
+            let uris: Vec<&str> = login
+                .and_then(|l| l.uris.as_ref())
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u.uri.as_deref())
+                .collect();
             let mut texts = vec![view.name.as_str(), username.as_str()];
             texts.extend(uris.iter().copied());
             if !matching::search_matches(query, &texts) {
@@ -1470,7 +1515,8 @@ impl Session {
                 username,
                 uri: web,
                 matched: "",
-                has_totp: login.totp.is_some(),
+                has_totp: login.is_some_and(|l| l.totp.is_some()),
+                kind,
             });
         }
         rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -1499,37 +1545,409 @@ impl Session {
         Ok(view)
     }
 
-    /// `fill`: the values of one item that the user picked. A wanted TOTP code that the item cannot give is an error
-    /// (`no_totp`): the browser asked for it because the row said the item has one.
-    pub async fn fill(
-        &self,
-        item: &str,
-        want_username: bool,
-        want_password: bool,
-        want_totp: bool,
-    ) -> Result<Values, Failure> {
-        let view = self.login_view(item).await?;
-        let Some(login) = view.login.as_ref() else {
-            return Err(Failure::new("no_item", "The item is not a login."));
-        };
+    /// The decrypted item that a row named: a login, a card or an identity.
+    async fn item_view(&self, item: &str) -> Result<CipherView, Failure> {
+        let client = self.client.as_ref().ok_or_else(locked)?;
+        let cipher = self
+            .ciphers
+            .iter()
+            .find(|c| id_is(c, item))
+            .cloned()
+            .ok_or_else(|| Failure::new("no_item", "The item is not in the vault any more."))?;
+        let view = client
+            .vault()
+            .ciphers()
+            .decrypt(cipher)
+            .await
+            .map_err(|_| Failure::new("decrypt", "The item cannot be decrypted."))?;
+        if !listed(&view) {
+            return Err(Failure::new(
+                "no_item",
+                "The item is not a login, a card or an identity.",
+            ));
+        }
+        Ok(view)
+    }
+
+    /// `fill`: the values of one item that the user picked, one per asked field that the item has. A field of another
+    /// kind of item gives nothing. A wanted TOTP code that a login cannot give is an error (`no_totp`): the browser
+    /// asked for it because the row said the item has one.
+    pub async fn fill(&self, item: &str, fields: &[String]) -> Result<Values, Failure> {
+        let view = self.item_view(item).await?;
         let mut values = Values::default();
-        if want_username {
-            values.username = login.username.clone();
-        }
-        if want_password {
-            values.password = login.password.clone();
-        }
-        if want_totp {
-            let code = totp_now(login.totp.as_deref())?;
-            values.totp = Some(code.code.to_string());
+        for name in fields {
+            if values.0.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let value = match (&view.r#type, &view.login, &view.card, &view.identity) {
+                (CipherType::Login, Some(login), _, _) => match name.as_str() {
+                    "username" => login.username.clone(),
+                    "password" => login.password.clone(),
+                    "totp" => Some(totp_now(login.totp.as_deref())?.code.to_string()),
+                    _ => None,
+                },
+                (CipherType::Card, _, Some(card), _) => card_field(card, name),
+                (CipherType::Identity, _, _, Some(identity)) => identity_field(identity, name),
+                _ => None,
+            };
+            if let Some(v) = value {
+                values.0.push((name.clone(), v));
+            }
         }
         Ok(values)
+    }
+
+    /// `save`: creates a login (`item` "") or updates one, through the SDK's vault client: it encrypts the item, sends
+    /// it to the server (POST /ciphers, PUT /ciphers/{id}) and keeps the password history. The server's copy then
+    /// goes into the helper's items and its state, so that `logins_for`, `search` and `fill` see it before a sync.
+    /// Returns the item's id.
+    pub async fn save(&mut self, req: SaveRequest<'_>) -> Result<String, Failure> {
+        let client = self.client.clone().ok_or_else(locked)?;
+        let uri = req.uri.trim();
+        let id = if req.item.is_empty() {
+            create_login(&client, &req, uri).await?
+        } else {
+            self.update_login(&client, &req, uri).await?
+        };
+        let cipher = stored_cipher(&client, id).await?;
+        let id = id.to_string();
+        self.keep_cipher(&id, cipher);
+        Ok(id)
+    }
+
+    /// The edit of an existing login: the non-empty username and password, and the page's address when none of the
+    /// item's addresses covers it. Returns its id.
+    async fn update_login(&self, client: &Client, req: &SaveRequest<'_>, uri: &str) -> Result<CipherId, Failure> {
+        let no_login = || Failure::new("no_item", "The item is not a login of the vault.");
+        let cipher = self
+            .ciphers
+            .iter()
+            .find(|c| id_is(c, req.item))
+            .cloned()
+            .ok_or_else(no_login)?;
+        let id = cipher.id.ok_or_else(no_login)?;
+        let view = client
+            .vault()
+            .ciphers()
+            .decrypt(cipher.clone())
+            .await
+            .map_err(|_| Failure::new("decrypt", "The item cannot be decrypted."))?;
+        if view.deleted_date.is_some() || !matches!(view.r#type, CipherType::Login) || view.login.is_none() {
+            return Err(no_login());
+        }
+        // the SDK's edit reads the item from the client's own store (its password history is kept against that copy);
+        // the helper keeps the items itself, so it puts this one there first
+        let repository = client.platform().state().get::<Cipher>().map_err(|_| not_saved())?;
+        repository.set(id, cipher).await.map_err(|_| not_saved())?;
+        let mut request = CipherEditRequest::try_from(view).map_err(|_| not_saved())?;
+        if let CipherViewType::Login(login) = &mut request.r#type {
+            if !req.username.is_empty() {
+                login.username = Some(req.username.to_string());
+            }
+            if !req.password.is_empty() {
+                login.password = Some(req.password.to_string());
+            }
+            if !uri.is_empty() {
+                let covered = {
+                    let saved: Vec<(&str, Rule)> = login
+                        .uris
+                        .iter()
+                        .flatten()
+                        .filter_map(|u| u.uri.as_deref().map(|s| (s, rule_of(&u.r#match))))
+                        .collect();
+                    matching::covered(uri, &saved)
+                };
+                if !covered {
+                    login.uris.get_or_insert_with(Vec::new).push(new_uri(uri));
+                }
+            }
+        }
+        client.vault().ciphers().edit(request).await.map_err(|e| match e {
+            EditCipherError::Api(a) => api_failure(&a),
+            _ => not_saved(),
+        })?;
+        Ok(id)
+    }
+
+    /// Puts the server's copy of a saved item into the helper's items and its state.
+    fn keep_cipher(&mut self, id: &str, cipher: Cipher) {
+        match self.ciphers.iter_mut().find(|c| id_is(c, id)) {
+            Some(c) => *c = cipher,
+            None => self.ciphers.push(cipher),
+        }
+        if let Some(saved) = self.saved.as_mut() {
+            saved.ciphers = self
+                .ciphers
+                .iter()
+                .filter_map(|c| serde_json::to_value(c).ok())
+                .collect();
+            // (the server has the item already: a failure here is no failure of the save, and the next sync writes it)
+            let _ = self.store.save(saved);
+        }
     }
 
     /// `totp`: the current code of one item's TOTP key, computed by the SDK.
     pub async fn totp(&self, item: &str) -> Result<Code, Failure> {
         let view = self.login_view(item).await?;
         totp_now(view.login.as_ref().and_then(|l| l.totp.as_deref()))
+    }
+}
+
+/// Whether the browser lists this item: a login, a card or an identity, not in the trash.
+fn listed(view: &CipherView) -> bool {
+    view.deleted_date.is_none()
+        && match view.r#type {
+            CipherType::Login => view.login.is_some(),
+            CipherType::Card => view.card.is_some(),
+            CipherType::Identity => view.identity.is_some(),
+            _ => false,
+        }
+}
+
+fn id_is(cipher: &Cipher, id: &str) -> bool {
+    cipher.id.map(|i| i.to_string()).as_deref() == Some(id)
+}
+
+/// A row's kind and the text it shows under the name: a login's username, a card's brand and last digits, an
+/// identity's name or email. `None` for the items that the browser does not list.
+fn summary(view: &CipherView) -> Option<(&'static str, String)> {
+    match (&view.r#type, &view.login, &view.card, &view.identity) {
+        (CipherType::Login, Some(l), _, _) => Some(("login", l.username.clone().unwrap_or_default())),
+        (CipherType::Card, _, Some(c), _) => Some(("card", card_label(c.brand.as_deref(), c.number.as_deref()))),
+        (CipherType::Identity, _, _, Some(i)) => Some(("identity", identity_label(i))),
+        _ => None,
+    }
+}
+
+/// "Visa *1234": the card's brand and the last 4 digits of its number; "" when it has no number. The rest of the
+/// number never leaves the helper in a row.
+pub fn card_label(brand: Option<&str>, number: Option<&str>) -> String {
+    let digits: Vec<char> = number.unwrap_or("").chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return String::new();
+    }
+    let last: String = digits[digits.len().saturating_sub(4)..].iter().collect();
+    match brand.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => format!("{b} *{last}"),
+        None => format!("*{last}"),
+    }
+}
+
+/// An identity's full name, else its email, else "".
+pub fn identity_label(i: &IdentityView) -> String {
+    let name = full_name(i);
+    if name.is_empty() {
+        i.email.as_deref().map(str::trim).unwrap_or("").to_string()
+    } else {
+        name
+    }
+}
+
+/// First, middle and last names, with single spaces.
+fn full_name(i: &IdentityView) -> String {
+    [&i.first_name, &i.middle_name, &i.last_name]
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn text(v: &Option<String>) -> Option<String> {
+    v.clone().filter(|s| !s.is_empty())
+}
+
+/// A card's field by its protocol name; `None` when the card does not have it or the name is no card field.
+pub fn card_field(c: &CardView, name: &str) -> Option<String> {
+    text(match name {
+        "cardholder" => &c.cardholder_name,
+        "number" => &c.number,
+        "exp_month" => &c.exp_month,
+        "exp_year" => &c.exp_year,
+        "code" => &c.code,
+        "brand" => &c.brand,
+        _ => return None,
+    })
+}
+
+/// An identity's field by its protocol name; `None` when the identity does not have it or the name is no identity
+/// field.
+pub fn identity_field(i: &IdentityView, name: &str) -> Option<String> {
+    if name == "full_name" {
+        return Some(full_name(i)).filter(|n| !n.is_empty());
+    }
+    text(match name {
+        "title" => &i.title,
+        "first_name" => &i.first_name,
+        "middle_name" => &i.middle_name,
+        "last_name" => &i.last_name,
+        "address1" => &i.address1,
+        "address2" => &i.address2,
+        "address3" => &i.address3,
+        "city" => &i.city,
+        "state" => &i.state,
+        "postal_code" => &i.postal_code,
+        "country" => &i.country,
+        "company" => &i.company,
+        "email" => &i.email,
+        "phone" => &i.phone,
+        "username" => &i.username,
+        "ssn" => &i.ssn,
+        "passport" => &i.passport_number,
+        "license" => &i.license_number,
+        _ => return None,
+    })
+}
+
+fn not_saved() -> Failure {
+    Failure::new("save_failed", "The item could not be saved.")
+}
+
+/// A refused or failed request of the vault's API: the server's sentence when it gave one.
+fn api_failure(e: &ApiError) -> Failure {
+    match e {
+        ApiError::Response(r) => Failure::new(
+            "save_failed",
+            error_message(&r.message)
+                .unwrap_or_else(|| format!("The server refused the item (status {}).", r.status.as_u16())),
+        ),
+        _ => Failure::new("save_failed", "The server cannot be reached: the item was not saved."),
+    }
+}
+
+fn new_uri(uri: &str) -> LoginUriView {
+    // (no match type: the account's default, as a login saved in Bitwarden's own clients)
+    LoginUriView {
+        uri: Some(uri.to_string()),
+        r#match: None,
+        uri_checksum: None,
+    }
+}
+
+fn some_text(v: &str) -> Option<String> {
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// A new login in the account's own vault (no organization, no folder), sent by the SDK. Returns its id. Its name is
+/// the browser's (the site's host), else the host of `uri`.
+async fn create_login(client: &Client, req: &SaveRequest<'_>, uri: &str) -> Result<CipherId, Failure> {
+    let name = match req.name.trim() {
+        "" => url::Url::parse(uri)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .ok_or_else(|| Failure::new("bad_request", "A new login needs a name."))?,
+        n => n.to_string(),
+    };
+    let login = LoginView {
+        username: some_text(req.username),
+        password: some_text(req.password),
+        password_revision_date: None,
+        uris: (!uri.is_empty()).then(|| vec![new_uri(uri)]),
+        totp: None,
+        autofill_on_page_load: None,
+        http_authentication_enabled: None,
+        fido2_credentials: None,
+    };
+    let request = CipherCreateRequest {
+        organization_id: None,
+        collection_ids: Vec::new(),
+        folder_id: None,
+        name,
+        notes: None,
+        favorite: false,
+        reprompt: CipherRepromptType::None,
+        r#type: CipherViewType::Login(login),
+        fields: Vec::new(),
+        archived_date: None,
+    };
+    let view = client.vault().ciphers().create(request).await.map_err(|e| match e {
+        CreateCipherError::Api(a) => api_failure(&a),
+        _ => not_saved(),
+    })?;
+    view.id.ok_or_else(not_saved)
+}
+
+/// The encrypted item as the server answered it: the SDK's create and edit keep it in the client's store.
+async fn stored_cipher(client: &Client, id: CipherId) -> Result<Cipher, Failure> {
+    let repository = client.platform().state().get::<Cipher>().map_err(|_| not_saved())?;
+    repository.get(id).await.ok().flatten().ok_or_else(not_saved)
+}
+
+/// A generator request, checked: the defaults filled in, the values out of range refused (`bad_request`).
+enum Recipe {
+    Password(PasswordGeneratorRequest),
+    Passphrase(PassphraseGeneratorRequest),
+}
+
+fn out_of_range(message: &str) -> Failure {
+    Failure::new("bad_request", message)
+}
+
+fn recipe(g: &Generate) -> Result<Recipe, Failure> {
+    match g.kind.as_str() {
+        "password" => {
+            let length = if g.length == 0 { PASSWORD_LENGTH } else { g.length };
+            if !(u32::from(MINIMUM_PASSWORD_LENGTH)..=u32::from(MAXIMUM_PASSWORD_LENGTH)).contains(&length) {
+                return Err(out_of_range(&format!(
+                    "A password has {MINIMUM_PASSWORD_LENGTH} to {MAXIMUM_PASSWORD_LENGTH} characters."
+                )));
+            }
+            if g.min_numbers > u32::from(MAXIMUM_MIN_CHAR_COUNT) || g.min_special > u32::from(MAXIMUM_MIN_CHAR_COUNT) {
+                return Err(out_of_range(&format!(
+                    "A minimum count of numbers or special characters is at most {MAXIMUM_MIN_CHAR_COUNT}."
+                )));
+            }
+            let all = !(g.uppercase || g.lowercase || g.numbers || g.special);
+            let numbers = all || g.numbers;
+            let special = all || g.special;
+            // (0: one of the class when it is on; the SDK ignores the minimum of a class that is off)
+            let minimum = |n: u32, on: bool| on.then(|| n.max(1) as u8);
+            Ok(Recipe::Password(PasswordGeneratorRequest {
+                lowercase: all || g.lowercase,
+                uppercase: all || g.uppercase,
+                numbers,
+                special,
+                length: length as u8,
+                min_number: minimum(g.min_numbers, numbers),
+                min_special: minimum(g.min_special, special),
+                ..Default::default()
+            }))
+        }
+        "passphrase" => {
+            let words = if g.words == 0 { PASSPHRASE_WORDS } else { g.words };
+            if !(u32::from(MINIMUM_PASSPHRASE_NUM_WORDS)..=u32::from(MAXIMUM_PASSPHRASE_NUM_WORDS)).contains(&words) {
+                return Err(out_of_range(&format!(
+                    "A passphrase has {MINIMUM_PASSPHRASE_NUM_WORDS} to {MAXIMUM_PASSPHRASE_NUM_WORDS} words."
+                )));
+            }
+            Ok(Recipe::Passphrase(PassphraseGeneratorRequest {
+                num_words: words as u8,
+                word_separator: if g.separator.is_empty() {
+                    PASSPHRASE_SEPARATOR.to_string()
+                } else {
+                    g.separator.clone()
+                },
+                capitalize: g.capitalize,
+                include_number: g.include_number,
+            }))
+        }
+        _ => Err(out_of_range("A generated value is a password or a passphrase.")),
+    }
+}
+
+/// `generate`: a password or a passphrase from the SDK's generator. It needs no account: a client without settings
+/// runs it, and nothing goes to a server.
+pub fn generate(g: &Generate) -> Result<Zeroizing<String>, Failure> {
+    let request = recipe(g)?;
+    let generator = ClientBuilder::new().build().generator();
+    match request {
+        Recipe::Password(r) => generator.password(r).map(Zeroizing::new).map_err(|_| {
+            out_of_range("The minimum counts of numbers and special characters do not fit in the length.")
+        }),
+        Recipe::Passphrase(r) => generator
+            .passphrase(r)
+            .map(Zeroizing::new)
+            .map_err(|_| out_of_range("The passphrase's options are out of range.")),
     }
 }
 
@@ -1876,6 +2294,415 @@ mod tests {
             "a group of one domain and an excluded group are left out"
         );
         assert_eq!(groups[1], vec!["google.com".to_string(), "youtube.com".to_string()]);
+    }
+
+    fn password(g: Generate) -> PasswordGeneratorRequest {
+        match recipe(&Generate {
+            kind: "password".into(),
+            ..g
+        }) {
+            Ok(Recipe::Password(r)) => r,
+            _ => panic!("not a password request"),
+        }
+    }
+
+    fn refused(g: Generate) -> &'static str {
+        match recipe(&g) {
+            Err(f) => f.code,
+            Ok(_) => "accepted",
+        }
+    }
+
+    #[test]
+    fn a_password_request_takes_its_defaults() {
+        let r = password(Generate::default());
+        assert_eq!(r.length, 20);
+        assert!(
+            r.lowercase && r.uppercase && r.numbers && r.special,
+            "no class: all four"
+        );
+        assert_eq!((r.min_number, r.min_special), (Some(1), Some(1)));
+        let r = password(Generate {
+            length: 32,
+            lowercase: true,
+            numbers: true,
+            min_numbers: 3,
+            ..Default::default()
+        });
+        assert_eq!(r.length, 32);
+        assert!(r.lowercase && r.numbers && !r.uppercase && !r.special);
+        assert_eq!((r.min_number, r.min_special), (Some(3), None));
+    }
+
+    #[test]
+    fn a_generate_request_out_of_range_is_refused() {
+        let pw = |length, min_numbers| Generate {
+            kind: "password".into(),
+            length,
+            min_numbers,
+            ..Default::default()
+        };
+        assert_eq!(refused(pw(4, 0)), "bad_request");
+        assert_eq!(refused(pw(129, 0)), "bad_request");
+        assert_eq!(refused(pw(5, 0)), "accepted");
+        assert_eq!(refused(pw(128, 0)), "accepted");
+        assert_eq!(refused(pw(20, 10)), "bad_request");
+        let words = |words| Generate {
+            kind: "passphrase".into(),
+            words,
+            ..Default::default()
+        };
+        assert_eq!(refused(words(2)), "bad_request");
+        assert_eq!(refused(words(21)), "bad_request");
+        assert_eq!(refused(words(3)), "accepted");
+        assert_eq!(refused(Generate::default()), "bad_request", "no kind");
+        // the minimums are in range but do not fit in the length: the SDK refuses them
+        let tight = Generate {
+            kind: "password".into(),
+            length: 5,
+            numbers: true,
+            special: true,
+            min_numbers: 3,
+            min_special: 3,
+            ..Default::default()
+        };
+        assert_eq!(generate(&tight).err().map(|f| f.code), Some("bad_request"));
+    }
+
+    #[test]
+    fn a_passphrase_request_takes_its_defaults() {
+        let Ok(Recipe::Passphrase(r)) = recipe(&Generate {
+            kind: "passphrase".into(),
+            ..Default::default()
+        }) else {
+            panic!("not a passphrase request");
+        };
+        assert_eq!(r.num_words, 5);
+        assert_eq!(r.word_separator, "-");
+        assert!(!r.capitalize && !r.include_number);
+        let value = generate(&Generate {
+            kind: "passphrase".into(),
+            words: 3,
+            separator: "_".into(),
+            capitalize: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let words: Vec<&str> = value.split('_').collect();
+        assert_eq!(words.len(), 3);
+        assert!(words.iter().all(|w| w.chars().next().is_some_and(char::is_uppercase)));
+        let value = generate(&Generate {
+            kind: "password".into(),
+            length: 12,
+            numbers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(value.len(), 12);
+        assert!(value.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    fn card() -> CardView {
+        CardView {
+            cardholder_name: Some("Ada Lovelace".into()),
+            exp_month: Some("7".into()),
+            exp_year: Some("2031".into()),
+            code: Some("123".into()),
+            brand: Some("Visa".into()),
+            number: Some("4111 1111 1111 1234".into()),
+        }
+    }
+
+    fn identity() -> IdentityView {
+        IdentityView {
+            title: Some("Dr".into()),
+            first_name: Some("Ada".into()),
+            middle_name: Some(" ".into()),
+            last_name: Some("King  Lovelace".into()),
+            address1: Some("1 Main St".into()),
+            address2: None,
+            address3: Some(String::new()),
+            city: Some("London".into()),
+            state: None,
+            postal_code: Some("W1".into()),
+            country: Some("GB".into()),
+            company: None,
+            email: Some("ada@example.com".into()),
+            phone: Some("+44 20".into()),
+            ssn: None,
+            username: Some("ada".into()),
+            passport_number: Some("P1".into()),
+            license_number: Some("L1".into()),
+        }
+    }
+
+    #[test]
+    fn a_card_row_shows_its_brand_and_last_digits() {
+        let c = card();
+        assert_eq!(card_label(c.brand.as_deref(), c.number.as_deref()), "Visa *1234");
+        assert_eq!(card_label(None, Some("5500-0000-0000-0004")), "*0004");
+        assert_eq!(card_label(Some("Amex"), Some("12")), "Amex *12");
+        assert_eq!(card_label(Some("Visa"), None), "");
+        assert_eq!(card_label(Some("Visa"), Some("")), "");
+    }
+
+    #[test]
+    fn an_identity_row_shows_its_name_or_its_email() {
+        let mut i = identity();
+        assert_eq!(identity_label(&i), "Ada King Lovelace");
+        i.first_name = None;
+        i.middle_name = None;
+        i.last_name = None;
+        assert_eq!(identity_label(&i), "ada@example.com");
+        i.email = None;
+        assert_eq!(identity_label(&i), "");
+    }
+
+    #[test]
+    fn a_fill_names_the_fields_of_cards_and_identities() {
+        let c = card();
+        let field = |n| card_field(&c, n);
+        assert_eq!(field("cardholder").as_deref(), Some("Ada Lovelace"));
+        assert_eq!(field("number").as_deref(), Some("4111 1111 1111 1234"));
+        assert_eq!(field("exp_month").as_deref(), Some("7"));
+        assert_eq!(field("exp_year").as_deref(), Some("2031"));
+        assert_eq!(field("code").as_deref(), Some("123"));
+        assert_eq!(field("brand").as_deref(), Some("Visa"));
+        // a login's field, or an identity's, gives nothing for a card
+        for name in ["username", "password", "totp", "first_name", "email"] {
+            assert_eq!(field(name), None, "{name}");
+        }
+        let i = identity();
+        let field = |n| identity_field(&i, n);
+        assert_eq!(field("full_name").as_deref(), Some("Ada King Lovelace"));
+        assert_eq!(field("title").as_deref(), Some("Dr"));
+        assert_eq!(field("first_name").as_deref(), Some("Ada"));
+        assert_eq!(field("last_name").as_deref(), Some("King  Lovelace"));
+        assert_eq!(field("address1").as_deref(), Some("1 Main St"));
+        assert_eq!(field("city").as_deref(), Some("London"));
+        assert_eq!(field("postal_code").as_deref(), Some("W1"));
+        assert_eq!(field("country").as_deref(), Some("GB"));
+        assert_eq!(field("email").as_deref(), Some("ada@example.com"));
+        assert_eq!(field("phone").as_deref(), Some("+44 20"));
+        assert_eq!(field("username").as_deref(), Some("ada"));
+        assert_eq!(field("passport").as_deref(), Some("P1"));
+        assert_eq!(field("license").as_deref(), Some("L1"));
+        // what the identity does not have (none, or empty) is not in the answer
+        for name in [
+            "address2", "address3", "state", "company", "ssn", "password", "number", "totp",
+        ] {
+            assert_eq!(field(name), None, "{name}");
+        }
+    }
+
+    const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const ITEM: &str = "5faa9684-c793-4a2d-8a12-b33900187097";
+
+    /// The server's answer to a POST or a PUT of an item: the item that it received, with its id and its dates.
+    struct Echo;
+
+    impl wiremock::Respond for Echo {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let mut v: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                for (k, x) in [
+                    ("object", serde_json::json!("cipher")),
+                    ("id", serde_json::json!(ITEM)),
+                    ("edit", serde_json::json!(true)),
+                    ("viewPassword", serde_json::json!(true)),
+                    ("creationDate", serde_json::json!("2026-11-12T10:00:00Z")),
+                    ("revisionDate", serde_json::json!("2026-11-12T10:00:00Z")),
+                ] {
+                    o.insert(k.into(), x);
+                }
+            }
+            wiremock::ResponseTemplate::new(200).set_body_json(v)
+        }
+    }
+
+    /// A session unlocked with keys made here (a V1 account: a user key and a private key that it wraps), with an
+    /// access token: what a login leaves, without the fixtures of a real account.
+    async fn unlocked(server: &wiremock::MockServer) -> Session {
+        use bitwarden_crypto::{KeyEncryptable, PublicKeyEncryptionAlgorithm, SymmetricKeyAlgorithm};
+        let config = Config {
+            identity_url: format!("{}/identity", server.uri()),
+            api_url: format!("{}/api", server.uri()),
+            client_version: "test".into(),
+            device_name: String::new(),
+        };
+        let mut s = Session::default();
+        s.hello(config.clone(), "", false)
+            .ok()
+            .expect("a loopback server is allowed");
+        let user_key = SymmetricCryptoKey::make(SymmetricKeyAlgorithm::Aes256CbcHmac);
+        let der = PrivateKey::make(PublicKeyEncryptionAlgorithm::RsaOaepSha1)
+            .to_der()
+            .expect("a private key has a DER form");
+        let private_key: EncString = (&der).encrypt_with_key(&user_key).expect("the user key wraps it");
+        let client = new_client(&config, "device");
+        let request = InitUserCryptoRequest {
+            user_id: USER.parse().ok(),
+            kdf_params: Kdf::default_pbkdf2(),
+            email: "user@example.com".into(),
+            account_cryptographic_state: WrappedAccountCryptographicState::V1 { private_key },
+            method: InitUserCryptoMethod::DecryptedKey {
+                decrypted_user_key: user_key.to_base64().to_string(),
+            },
+            upgrade_token: None,
+        };
+        assert!(
+            client.crypto().initialize_user_crypto(request).await.is_ok(),
+            "the made keys open"
+        );
+        set_tokens(&client, "access".into(), None, 3600).await;
+        s.client = Some(client);
+        s.saved = Some(Saved::default());
+        s
+    }
+
+    fn saved_ok(r: Result<String, Failure>) -> String {
+        r.unwrap_or_else(|f| panic!("{}: {}", f.code, f.message))
+    }
+
+    #[tokio::test]
+    async fn save_creates_then_updates_a_login_that_the_vault_sees_at_once() {
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{header, method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/ciphers"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(Echo)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/ciphers/{ITEM}")))
+            .respond_with(Echo)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut s = unlocked(&server).await;
+        let created = s
+            .save(SaveRequest {
+                name: "a.example",
+                uri: "https://a.example/login",
+                username: "me",
+                password: "first secret",
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(saved_ok(created), ITEM);
+        let requests = server.received_requests().await.unwrap();
+        let posted = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !posted.contains("first secret") && !posted.contains("a.example"),
+            "the item goes encrypted"
+        );
+        // (no sync: the server's answer is in the helper's items and its state)
+        let rows = s.search("a.example", 0).await.unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].kind, rows[0].username.as_str()), ("login", "me"));
+        let page = Page {
+            url: "https://www.a.example/",
+            host: "www.a.example",
+            domain: "a.example",
+            equivalent: &[],
+        };
+        assert_eq!(s.logins_for(&page).await.unwrap_or_default().len(), 1);
+        assert_eq!(s.saved.as_ref().map(|v| v.ciphers.len()), Some(1));
+        let fields = ["username".to_string(), "password".to_string()];
+        let values = s.fill(ITEM, &fields).await.unwrap_or_default();
+        assert_eq!(
+            values.0,
+            vec![
+                ("username".to_string(), "me".to_string()),
+                ("password".to_string(), "first secret".to_string())
+            ]
+        );
+        drop(values);
+
+        // an update of the password, from a page that the saved address covers: no new address
+        let updated = s
+            .save(SaveRequest {
+                item: ITEM,
+                uri: "https://www.a.example/other",
+                password: "second secret",
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(saved_ok(updated), ITEM);
+        let requests = server.received_requests().await.unwrap();
+        let put: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            put["passwordHistory"].as_array().map(Vec::len),
+            Some(1),
+            "the SDK keeps the former password in the history"
+        );
+        let values = s.fill(ITEM, &fields).await.unwrap_or_default();
+        assert_eq!(values.0[0].1, "me", "an empty username leaves it as it is");
+        assert_eq!(values.0[1].1, "second secret");
+        drop(values);
+        let page = Page {
+            url: "https://b.example/",
+            host: "b.example",
+            domain: "b.example",
+            equivalent: &[],
+        };
+        assert!(s.logins_for(&page).await.unwrap_or_default().is_empty());
+
+        // a page of another site: its address joins the item's
+        let updated = s
+            .save(SaveRequest {
+                item: ITEM,
+                uri: "https://b.example/",
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(saved_ok(updated), ITEM);
+        assert_eq!(s.logins_for(&page).await.unwrap_or_default().len(), 1);
+        assert_eq!(s.ciphers.len(), 1, "an update replaces the item");
+
+        let missing = s
+            .save(SaveRequest {
+                item: "6faa9684-c793-4a2d-8a12-b33900187097",
+                password: "x",
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(missing.err().map(|f| f.code), Some("no_item"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_save_says_why() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/ciphers"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "The field Name must be a string with a maximum length of 1000.",
+                "object": "error"
+            })))
+            .mount(&server)
+            .await;
+        let mut s = unlocked(&server).await;
+        let failure = s
+            .save(SaveRequest {
+                name: "a.example",
+                password: "pw",
+                ..Default::default()
+            })
+            .await
+            .err()
+            .expect("the server refused it");
+        assert_eq!(failure.code, "save_failed");
+        assert!(failure.message.contains("maximum length"), "{}", failure.message);
+        assert!(s.ciphers.is_empty());
     }
 
     #[test]

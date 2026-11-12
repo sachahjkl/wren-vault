@@ -732,14 +732,24 @@ async fn sync_fill_and_pins_need_an_unlocked_vault() {
     let server = MockServer::start().await;
     let mut s = session_for(&server);
     assert_eq!(s.sync().await.err().map(|e| e.code), Some("locked"));
+    let fields = ["username".to_string(), "password".to_string()];
+    assert_eq!(s.fill("id", &fields).await.err().map(|e| e.code), Some("locked"));
     assert_eq!(
-        s.fill("id", true, true, false).await.err().map(|e| e.code),
+        s.fill("id", &["totp".to_string()]).await.err().map(|e| e.code),
         Some("locked")
     );
-    assert_eq!(
-        s.fill("id", false, false, true).await.err().map(|e| e.code),
-        Some("locked")
-    );
+    let save = wren_vault::sdk::SaveRequest {
+        name: "a.example",
+        password: "pw",
+        ..Default::default()
+    };
+    assert_eq!(s.save(save).await.err().map(|e| e.code), Some("locked"));
+    // (a generated value needs no account)
+    let generate = wren_vault::sdk::Generate {
+        kind: "password".into(),
+        ..Default::default()
+    };
+    assert_eq!(wren_vault::sdk::generate(&generate).map(|v| v.len()).ok(), Some(20));
     assert_eq!(s.search("git", 0).await.err().map(|e| e.code), Some("locked"));
     assert_eq!(s.totp("id").await.err().map(|e| e.code), Some("locked"));
     assert_eq!(s.pin_set("1234").err().map(|e| e.code), Some("locked"));

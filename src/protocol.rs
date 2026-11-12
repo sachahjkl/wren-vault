@@ -120,11 +120,53 @@ pub enum Op {
         #[serde(default)]
         limit: usize,
     },
-    /// The values of one login, for a fill or a copy that the user asked for: `fields` lists "username", "password",
-    /// "totp" (the current code).
+    /// The values of one item, for a fill or a copy that the user asked for: `fields` lists a login's "username",
+    /// "password", "totp" (the current code), a card's or an identity's fields (README.md, "Fill").
     Fill { item: String, fields: Vec<String> },
     /// The current code of one login's TOTP key, and the seconds it stays valid.
     Totp { item: String },
+    /// Create a login (`item` "") or update one (`item` its id). On update, only the non-empty `username` and
+    /// `password` change, and `uri` is added when none of the item's addresses covers it.
+    Save {
+        #[serde(default)]
+        item: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        uri: String,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        password: Secret,
+    },
+    /// A new password or passphrase from the SDK's generator. Needs no unlocked vault. A field left out (or 0, "",
+    /// false) takes its default (`sdk::Generate`).
+    Generate {
+        /// "password" or "passphrase".
+        kind: String,
+        #[serde(default)]
+        length: u32,
+        #[serde(default)]
+        uppercase: bool,
+        #[serde(default)]
+        lowercase: bool,
+        #[serde(default)]
+        numbers: bool,
+        #[serde(default)]
+        special: bool,
+        #[serde(default)]
+        min_numbers: u32,
+        #[serde(default)]
+        min_special: u32,
+        #[serde(default)]
+        words: u32,
+        #[serde(default)]
+        separator: String,
+        #[serde(default)]
+        capitalize: bool,
+        #[serde(default)]
+        include_number: bool,
+    },
     /// The user is active: the idle deadline starts again. No answer.
     Keepalive,
 }
@@ -178,12 +220,15 @@ pub struct Row {
     /// How it matched: "domain", "host", "equivalent", "starts_with" or "exact"; "" for a `search` row.
     pub matched: &'static str,
     pub has_totp: bool,
+    /// "login", "card" or "identity".
+    pub kind: &'static str,
 }
 
 impl Row {
     pub fn to_json(&self) -> Value {
         let mut v = json!({
             "id": self.id, "name": self.name, "username": self.username, "uri": self.uri, "has_totp": self.has_totp,
+            "kind": self.kind,
         });
         if let (false, Some(o)) = (self.matched.is_empty(), v.as_object_mut()) {
             o.insert("match".into(), json!(self.matched));
@@ -262,6 +307,74 @@ mod tests {
     }
 
     #[test]
+    fn save_and_generate_parse_with_their_defaults() {
+        let r: Request = serde_json::from_str(
+            r#"{"id":20,"op":"save","item":"","name":"a.example","uri":"https://a.example/login","username":"me","password":"pw"}"#,
+        )
+        .unwrap();
+        match r.op {
+            Op::Save {
+                item,
+                name,
+                uri,
+                username,
+                password,
+            } => {
+                assert_eq!(item, "");
+                assert_eq!(name, "a.example");
+                assert_eq!(uri, "https://a.example/login");
+                assert_eq!(username, "me");
+                assert_eq!(password.as_str(), "pw");
+            }
+            _ => panic!("not a save"),
+        }
+        // an update of the password only: the other fields are empty
+        let r: Request = serde_json::from_str(r#"{"id":21,"op":"save","item":"x","password":"new"}"#).unwrap();
+        assert!(
+            matches!(&r.op, Op::Save { item, username, uri, .. } if item == "x" && username.is_empty() && uri.is_empty())
+        );
+        let r: Request = serde_json::from_str(r#"{"id":22,"op":"generate","kind":"password"}"#).unwrap();
+        match r.op {
+            Op::Generate {
+                kind,
+                length,
+                uppercase,
+                special,
+                words,
+                separator,
+                ..
+            } => {
+                assert_eq!(kind, "password");
+                assert_eq!((length, words), (0, 0));
+                assert!(!uppercase && !special);
+                assert!(separator.is_empty());
+            }
+            _ => panic!("not a generate"),
+        }
+        let r: Request = serde_json::from_str(
+            r#"{"id":23,"op":"generate","kind":"passphrase","words":6,"separator":".","capitalize":true,"include_number":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r.op,
+            Op::Generate {
+                words: 6,
+                capitalize: true,
+                include_number: true,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<Request>(r#"{"id":24,"op":"generate"}"#).is_err(),
+            "a kind is needed"
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"id":25,"op":"generate","kind":"password","length":-1}"#).is_err(),
+            "a negative length is no request"
+        );
+    }
+
+    #[test]
     fn an_unknown_op_is_refused() {
         assert!(serde_json::from_str::<Request>(r#"{"id":1,"op":"dump_keys"}"#).is_err());
     }
@@ -282,8 +395,10 @@ mod tests {
             uri: "https://a.example".into(),
             matched: "",
             has_totp: true,
+            kind: "login",
         };
         assert!(row.to_json().get("match").is_none(), "a search row has no match type");
+        assert_eq!(row.to_json()["kind"], "login");
         let ev = event("locked");
         assert_eq!(ev["id"], 0);
         assert_eq!(ev["event"], "locked");

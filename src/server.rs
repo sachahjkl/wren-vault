@@ -18,7 +18,7 @@ use crate::{
     identity::Assertion,
     matching::Page,
     protocol::{self, Op, Request},
-    sdk::{Config, DevicePoll, Failure, LoginOutcome, LoginRequest, Session, Unlock},
+    sdk::{self, Config, DevicePoll, Failure, Generate, LoginOutcome, LoginRequest, SaveRequest, Session, Unlock},
 };
 
 /// What the loop does after an answer.
@@ -288,25 +288,68 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             }
             Err(f) => fail(f),
         },
-        Op::Fill { item, fields } => {
-            let want = |name: &str| fields.iter().any(|f| f == name);
-            match session
-                .fill(&item, want("username"), want("password"), want("totp"))
-                .await
-            {
-                Ok(values) => {
-                    let mut body = serde_json::Map::new();
-                    for (key, v) in [
-                        ("username", &values.username),
-                        ("password", &values.password),
-                        ("totp", &values.totp),
-                    ] {
-                        if let Some(v) = v {
-                            body.insert(key.into(), Value::String(v.clone()));
-                        }
-                    }
-                    done(Value::Object(body))
+        Op::Fill { item, fields } => match session.fill(&item, &fields).await {
+            Ok(values) => {
+                let mut body = serde_json::Map::new();
+                for (key, v) in &values.0 {
+                    body.insert(key.clone(), Value::String(v.clone()));
                 }
+                done(Value::Object(body))
+            }
+            Err(f) => fail(f),
+        },
+        Op::Save {
+            item,
+            name,
+            uri,
+            username,
+            password,
+        } => {
+            let request = SaveRequest {
+                item: &item,
+                name: &name,
+                uri: &uri,
+                username: &username,
+                password: password.as_str(),
+            };
+            let result = session.save(request).await;
+            drop(password);
+            match result {
+                Ok(id) => done(json!({ "item": id })),
+                Err(f) => fail(f),
+            }
+        }
+        Op::Generate {
+            kind,
+            length,
+            uppercase,
+            lowercase,
+            numbers,
+            special,
+            min_numbers,
+            min_special,
+            words,
+            separator,
+            capitalize,
+            include_number,
+        } => {
+            let request = Generate {
+                kind,
+                length,
+                uppercase,
+                lowercase,
+                numbers,
+                special,
+                min_numbers,
+                min_special,
+                words,
+                separator,
+                capitalize,
+                include_number,
+            };
+            match sdk::generate(&request) {
+                // (the value is a secret: the loop writes the answer from zeroed bytes, as a fill's)
+                Ok(value) => done(json!({ "value": value.as_str() })),
                 Err(f) => fail(f),
             }
         }
@@ -344,7 +387,7 @@ mod tests {
     }
 
     fn hello(id: u64, dir: &str, idle_seconds: u64) -> Value {
-        json!({"id": id, "op": "hello", "protocol": 4, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
+        json!({"id": id, "op": "hello", "protocol": 5, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
                "api_url": "http://127.0.0.1:9/api", "persist": !dir.is_empty(), "idle_seconds": idle_seconds})
     }
 
@@ -370,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remote_http_server_is_refused() {
-        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 4, "state_dir": "",
+        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 5, "state_dir": "",
             "identity_url": "http://example.com/identity", "api_url": "https://example.com/api"})])
         .await;
         assert_eq!(answers[0]["error"], "bad_server");
@@ -398,8 +441,13 @@ mod tests {
             json!({"id": 8, "op": "search", "query": "git"}),
             json!({"id": 9, "op": "totp", "item": "x"}),
             json!({"id": 10, "op": "fill", "item": "x", "fields": ["totp"]}),
+            json!({"id": 11, "op": "save", "item": "", "name": "a.example", "uri": "https://a.example/",
+                   "username": "me", "password": "pw"}),
+            json!({"id": 12, "op": "save", "item": "x", "password": "pw"}),
         ])
         .await;
+        assert_eq!(answers[10]["error"], "locked");
+        assert_eq!(answers[11]["error"], "locked");
         assert_eq!(answers[7]["error"], "locked");
         assert_eq!(answers[8]["error"], "locked");
         assert_eq!(answers[9]["error"], "locked");
@@ -431,6 +479,28 @@ mod tests {
         assert_eq!(answers[5]["error"], "bad_request");
         assert_eq!(answers[6]["error"], "bad_request");
         assert_eq!(answers[0]["passkey"], false);
+    }
+
+    #[tokio::test]
+    async fn generate_needs_no_unlocked_vault() {
+        let answers = exchange(&[
+            json!({"id": 1, "op": "generate", "kind": "password"}),
+            hello(2, "", 0),
+            json!({"id": 3, "op": "generate", "kind": "password"}),
+            json!({"id": 4, "op": "generate", "kind": "passphrase", "words": 4, "separator": "_"}),
+            json!({"id": 5, "op": "generate", "kind": "password", "length": 4}),
+            json!({"id": 6, "op": "generate", "kind": "passphrase", "words": 21}),
+            json!({"id": 7, "op": "generate", "kind": "pin"}),
+        ])
+        .await;
+        assert_eq!(answers[0]["error"], "no_hello");
+        let password = answers[2]["value"].as_str().unwrap();
+        assert_eq!(password.chars().count(), 20);
+        let passphrase = answers[3]["value"].as_str().unwrap();
+        assert_eq!(passphrase.split('_').count(), 4);
+        for a in &answers[4..] {
+            assert_eq!(a["error"], "bad_request", "{a}");
+        }
     }
 
     #[tokio::test]

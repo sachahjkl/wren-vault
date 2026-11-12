@@ -1,6 +1,6 @@
 [package]
 name = "wren-vault"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-only"
@@ -27,6 +27,8 @@ bitwarden-auth = { git = "https://github.com/bitwarden/sdk-internal", rev = "300
 bitwarden-core = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7", features = ["internal"] }
 bitwarden-crypto = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
 bitwarden-crypto-sync-handler = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-generators = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-state = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
 bitwarden-sync = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
 bitwarden-vault = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
 async-trait = "0.1.89"

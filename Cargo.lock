@@ -466,6 +466,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitwarden-generators"
+version = "4.0.0"
+source = "git+https://github.com/bitwarden/sdk-internal?rev=300aea5933ef3bc139e430575b6868b9a9b1d4a7#300aea5933ef3bc139e430575b6868b9a9b1d4a7"
+dependencies = [
+ "bitwarden-core",
+ "bitwarden-crypto",
+ "bitwarden-error",
+ "bitwarden-ffi",
+ "bitwarden-random",
+ "password-rules-parser",
+ "rand",
+ "reqwest",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bitwarden-logging"
 version = "4.0.0"
 source = "git+https://github.com/bitwarden/sdk-internal?rev=300aea5933ef3bc139e430575b6868b9a9b1d4a7#300aea5933ef3bc139e430575b6868b9a9b1d4a7"
@@ -911,6 +930,16 @@ name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
+name = "colored"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
+dependencies = [
+ "lazy_static",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "combine"
@@ -2321,6 +2350,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "mio"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2384,6 +2419,16 @@ dependencies = [
  "hybrid-array",
  "num-traits",
  "zeroize",
+]
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
 ]
 
 [[package]]
@@ -2543,6 +2588,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
  "phc",
+]
+
+[[package]]
+name = "password-rules-parser"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f9f1ea3b803a37c42e84fa581354c8eee6c68b63b4923483d5d5d78286e32a"
+dependencies = [
+ "itertools",
+ "nom",
+ "once_cell",
+ "pretty-lint",
 ]
 
 [[package]]
@@ -2708,6 +2765,15 @@ checksum = "d0de1b847b39c8131db0467e9df1ff60e6d0562ab8e9a16e568ad0fdb372e2f2"
 dependencies = [
  "predicates-core",
  "termtree",
+]
+
+[[package]]
+name = "pretty-lint"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37a28eb055b711a1daa116969810f3a7f61150044009d90ac4b8a5faa888199b"
+dependencies = [
+ "colored",
 ]
 
 [[package]]
@@ -4304,7 +4370,7 @@ dependencies = [
 
 [[package]]
 name = "wren-vault"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bitwarden-api-api",
@@ -4312,6 +4378,8 @@ dependencies = [
  "bitwarden-core",
  "bitwarden-crypto",
  "bitwarden-crypto-sync-handler",
+ "bitwarden-generators",
+ "bitwarden-state",
  "bitwarden-sync",
  "bitwarden-vault",
  "chrono",

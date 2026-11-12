@@ -102,6 +102,38 @@ pub fn equivalent_of(groups: &[Vec<String>], domain: &str) -> Vec<String> {
     out
 }
 
+/// Whether one of an item's saved URIs (each with its rule) already covers `address`: a `save` adds the address to an
+/// item only when none does, so that the item does not collect one URI per page of a site. Without a Public Suffix
+/// List, a `Domain` URI covers the address when the address's host is the saved host or one of its subdomains. An
+/// address that is no URL is covered only by the same text.
+pub fn covered(address: &str, saved: &[(&str, Rule)]) -> bool {
+    let address = address.trim();
+    let Ok(url) = Url::parse(address) else {
+        return saved.iter().any(|(s, _)| s.trim() == address);
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    saved.iter().any(|(s, rule)| {
+        if s.trim() == address {
+            return true;
+        }
+        // (the saved host stands in for the registrable domain that the helper cannot compute)
+        let domain = match (
+            rule,
+            parse_saved(s).and_then(|u| u.host_str().map(str::to_ascii_lowercase)),
+        ) {
+            (Rule::Domain, Some(h)) if inside(&host, &h) => h,
+            _ => String::new(),
+        };
+        let page = Page {
+            url: address,
+            host: &host,
+            domain: &domain,
+            equivalent: &[],
+        };
+        matches(&page, s, *rule).is_some()
+    })
+}
+
 /// Whether every word of `query` (split on white space, case aside) is in one of `texts`. An empty query matches.
 pub fn search_matches(query: &str, texts: &[&str]) -> bool {
     let lower: Vec<String> = texts.iter().map(|t| t.to_lowercase()).collect();
@@ -221,6 +253,21 @@ mod tests {
         assert_eq!(matches(&p, "androidapp://com.example", Rule::Domain), None);
         let f = page("file:///tmp/a.html", "", "");
         assert_eq!(matches(&f, "https://example.com", Rule::Domain), None);
+    }
+
+    #[test]
+    fn a_saved_uri_covers_the_pages_of_its_site() {
+        let page = "https://login.example.com/signin?x=1";
+        assert!(covered(page, &[("https://example.com", Rule::Domain)]));
+        assert!(covered(page, &[("login.example.com", Rule::Domain)]));
+        assert!(covered(page, &[("https://login.example.com/", Rule::Host)]));
+        assert!(covered(page, &[("https://login.example.com/signin", Rule::StartsWith)]));
+        assert!(!covered(page, &[("https://other.example.com", Rule::Domain)]));
+        assert!(!covered(page, &[("https://example.com", Rule::Host)]));
+        assert!(!covered(page, &[("https://login.example.com/", Rule::Never)]));
+        assert!(!covered(page, &[]));
+        assert!(covered("not a url", &[("not a url", Rule::Domain)]));
+        assert!(!covered("not a url", &[("https://example.com", Rule::Domain)]));
     }
 
     #[test]

@@ -17,7 +17,7 @@ wren-vault are separate programs that exchange the messages of the protocol belo
 |---|---|
 | Repository | https://github.com/bitwarden/sdk-internal |
 | Revision | `300aea5933ef3bc139e430575b6868b9a9b1d4a7` (2026-11-12, workspace version 4.0.0) |
-| Crates | `bitwarden-core` (feature `internal`), `bitwarden-auth`, `bitwarden-vault`, `bitwarden-sync`, `bitwarden-crypto-sync-handler`, `bitwarden-api-api`, `bitwarden-crypto` |
+| Crates | `bitwarden-core` (feature `internal`), `bitwarden-auth`, `bitwarden-vault`, `bitwarden-sync`, `bitwarden-crypto-sync-handler`, `bitwarden-api-api`, `bitwarden-crypto`, `bitwarden-generators`, `bitwarden-state` |
 | Features | Default only. Never `wasm`, `uniffi`, `bitwarden-license`, `no-memory-hardening`, `dangerous-crypto-debug`, `debug-capabilities`. |
 | Minimum Rust | 1.89 (edition 2024) |
 
@@ -40,7 +40,12 @@ files must be present (the Nix flake provides them).
 
 ## Protocol
 
-Version 4 (this helper 0.4.0). Changes from version 3: new requests `password_hint`, `device_request`, `device_poll`,
+Version 5 (this helper 0.5.0). Changes from version 4: `hello` takes and answers `protocol` 5; new requests `save`
+(create or update a login, on the server and at once in the helper's copy of the vault) and `generate` (a password or a
+passphrase from the SDK's generator, also while locked); the rows of `search` list cards and identities too, and every
+row carries `kind`; `fill` gives the fields of a card or an identity; the error `save_failed`.
+
+Version 4 (helper 0.4.0). Changes from version 3: new requests `password_hint`, `device_request`, `device_poll`,
 `passkey_options` and `login_passkey`; `login` takes `remember`; `unlock` takes `prf` and `credential_id`; `hello`
 answers `passkey`; the errors `denied`, `expired`, `no_passkey` and `account_locked`. Every token request carries the
 headers `Auth-Email` (a password login) and `Bitwarden-Client-Version`, without which the server refuses it.
@@ -79,7 +84,7 @@ request but `hello` needs a `hello` before it (`no_hello`).
 
 | op | Request fields | Answer fields |
 |---|---|---|
-| `hello` | `protocol` (4), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
+| `hello` | `protocol` (5), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
 | `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
 | `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email` |
 | `unlock` | `password`, `pin`, or `prf` and `credential_id` (a passkey) | none; a `bad_pin` error carries `tries_left` |
@@ -88,9 +93,11 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
 | `pin_set` | `pin` (4 characters or more) | none |
 | `pin_clear` | none | none |
-| `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp}`; `equivalent`: the domains that the account makes equivalent to `domain` |
-| `search` | `query` (words), `limit` (0: 50; never more than 50) | `rows`: `{id, name, username, uri, has_totp}`, sorted by name; `uri` is the item's first `http` or `https` address (`""` if none) |
-| `fill` | `item` (a row id), `fields` (a list of `"username"`, `"password"`, `"totp"`) | `username`, `password` (only the asked fields that the item has), `totp` (the current code) |
+| `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp, kind}` (logins only: `kind` is `"login"`); `equivalent`: the domains that the account makes equivalent to `domain` |
+| `search` | `query` (words), `limit` (0: 50; never more than 50) | `rows`: `{id, name, username, uri, has_totp, kind}`, sorted by name; `uri` is a login's first `http` or `https` address (`""` if none); see "Item kinds" |
+| `fill` | `item` (a row id), `fields` (a list of field names, see "Fill") | one field per asked name that the item has, named the same; `totp` is the current code |
+| `save` | `item` (`""`: create a login; else the id of the login to update), `name` (on create: the site's host), `uri` (the page's address, `""` = none), `username`, `password` | `item` (the id of the created or updated login) |
+| `generate` | `kind` (`"password"` or `"passphrase"`); password: `length`, `uppercase`, `lowercase`, `numbers`, `special`, `min_numbers`, `min_special`; passphrase: `words`, `separator`, `capitalize`, `include_number` (see "Generate") | `value` (zeroed by the helper once written) |
 | `totp` | `item` | `totp` (the current code), `period` and `remaining` (seconds) |
 | `password_hint` | `email` | none; the server mails the hint to the account's address |
 | `device_request` | `email` | `fingerprint` (the phrase the other device shows) |
@@ -114,6 +121,59 @@ request but `hello` needs a `hello` before it (`no_hello`).
   answers `need_two_factor` with `email_sent` true. With `"device"`, it sends the first step again, and the server
   mails a new code. `email_sent` is also true when the email code is the account's only second step: the server mailed
   it with its answer.
+
+### Item kinds
+
+`search` lists logins, cards and identities (`kind` `"login"`, `"card"`, `"identity"`); secure notes and SSH keys are
+not listed. `logins_for` lists logins only.
+
+- A card row: `name` the item's name, `username` the brand and the last 4 digits (`"Visa *1234"`; `""` when the card
+  has no number), `uri` `""`. No other digit of the number is in a row.
+- An identity row: `name` the item's name, `username` the full name, else the email; `uri` `""`.
+- `has_totp` is false for cards and identities.
+
+### Fill
+
+`fields` names what the browser asks:
+
+- login: `"username"`, `"password"`, `"totp"` (the current code; `no_totp` when the login has no readable key);
+- card: `"cardholder"`, `"number"`, `"exp_month"` (as stored, `"1"` to `"12"`), `"exp_year"` (as stored), `"code"`,
+  `"brand"`;
+- identity: `"title"`, `"first_name"`, `"middle_name"`, `"last_name"`, `"full_name"` (first, middle and last, with
+  single spaces), `"address1"`, `"address2"`, `"address3"`, `"city"`, `"state"`, `"postal_code"`, `"country"`,
+  `"company"`, `"email"`, `"phone"`, `"username"`, `"ssn"`, `"passport"`, `"license"`.
+
+The answer has one field per asked name that the item has (a card's and an identity's empty fields are left out). A
+name of another kind of item gives nothing, without an error.
+
+### Save
+
+`save` needs an unlocked vault (`locked`).
+
+- Create (`item` `""`): a login in the account's own vault (no organization, no folder), with `name` (the host of `uri`
+  when `name` is empty), the `uri` (with the account's default match rule), `username` and `password`.
+- Update (`item` an id): only the non-empty `username` and `password` change; the SDK keeps the former password in the
+  item's password history. `uri` joins the item's addresses when none of them covers it (the rules of "Matching"; a
+  `Domain` address covers the subdomains of its host). An id that is not a login of the vault: `no_item`.
+- The SDK encrypts the item and sends it: `POST {api}/ciphers` (create), `PUT {api}/ciphers/{id}` (update). The
+  server's answer goes into the helper's items and its state: `logins_for`, `search` and `fill` see it before the next
+  sync.
+- The server refused it, or cannot be reached: `save_failed`, with the server's sentence when it gave one.
+
+### Generate
+
+The SDK's generator (`bitwarden-generators`) makes the value; no account and no server are needed, only `hello`.
+
+| Field | Default (0, `""`, all false) | Range |
+|---|---|---|
+| `length` | 20 | 5 to 128 |
+| `uppercase`, `lowercase`, `numbers`, `special` | all four on when none is | |
+| `min_numbers`, `min_special` | 1 when the class is on | 0 to 9; their sum fits in `length` |
+| `words` | 5 | 3 to 20 |
+| `separator` | `"-"` | |
+| `capitalize`, `include_number` | false | |
+
+A value out of range, or another `kind`: `bad_request`.
 
 ### Idle deadline
 
@@ -142,8 +202,9 @@ its own timer, and sends `keepalive` while the person is active.
 | `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
-| `no_item` | `fill` or `totp` names an item that is not a login of the vault. |
+| `no_item` | `fill` names an item that is not a login, a card or an identity of the vault; `totp` or a `save` update names one that is not a login. |
 | `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
+| `save_failed` | `save`: the server refused the item, or cannot be reached. The message says why. |
 | `denied` | The other device refused the login (`device_poll`). |
 | `expired` | The login with a device was not approved in time: ask again. |
 | `no_passkey` | No passkey of the account opens its keys (a passkey without PRF, or none for this vault). |
@@ -170,8 +231,9 @@ last sync gave them (kept in the state as `equivalent_domains`). The helper has 
 sends the registrable domain, and it checks every row again with its own list before it shows it; for an `equivalent`
 row it checks that the saved host's registrable domain is in the answer's `equivalent`.
 
-`search` matches each word of the query, case aside, in the item's name, user name or one of its URIs. It returns no
-password and no code: a palette shows its rows.
+`search` matches each word of the query, case aside, in the item's name, the text of its row's `username` (a card's
+brand and last digits, an identity's name or email) or one of a login's URIs. It returns no password, no code and no
+card number: a palette shows its rows.
 
 TOTP codes are the SDK's (`generate_totp`): an `otpauth://` URI, a `steam://` URI or a base32 secret; SHA-1, SHA-256 or
 SHA-512; the key's digits and period.
@@ -249,8 +311,10 @@ fifth one in a row deletes the envelope (`pin_reset`). A new login starts withou
 
 - `cargo test`: the frame codec, the protocol, the idle deadline (on tokio's paused clock), the matching rules (the
   equivalent domains and the search included), the TOTP codes (RFC 6238's vectors), the state file, the token store and its file fallback (with a fake system store), the PIN try counter, the form of the
-  token request, and the login against a wiremock server on loopback (wrong password, the authenticator and email
-  second steps, the new-device code, the API key, no server). No test contacts a real server.
+  token request, the generator's options, the rows and fill fields of cards and identities, and the login against a
+  wiremock server on loopback (wrong password, the authenticator and email second steps, the new-device code, the API
+  key, no server). `save` runs against wiremock with a session unlocked by keys that the test makes (create, update,
+  the password history, a refusal). No test contacts a real server.
 - A successful login needs fixtures made once from a test account (prelogin, token and sync answers). They are not in
   the repository yet.
 - Manual check before a release that changes the SDK revision: log in with a real account (US and EU), sync, fill.
