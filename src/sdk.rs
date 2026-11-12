@@ -402,7 +402,7 @@ impl Session {
             },
             second,
         );
-        match token_request(&client, &form).await? {
+        match token_request(&client, &form, Some(email)).await? {
             TokenAnswer::Tokens {
                 access_token,
                 refresh_token,
@@ -455,7 +455,7 @@ impl Session {
                 name: &config.device_name,
             },
         );
-        match token_request(&client, &form).await? {
+        match token_request(&client, &form, None).await? {
             TokenAnswer::Tokens {
                 access_token,
                 refresh_token,
@@ -1036,19 +1036,19 @@ fn new_client(config: &Config, device_id: &str) -> Client {
 
 /// Sends a token request with the SDK's HTTP client of the identity server (its TLS roots, its user agent and its
 /// `Device-Type` header) and reads the answer.
-async fn token_request(client: &Client, form: &str) -> Result<TokenAnswer, Failure> {
+async fn token_request(client: &Client, form: &str, auth_email: Option<&str>) -> Result<TokenAnswer, Failure> {
     let network = || Failure::new("network", "The server cannot be reached, or it refused the request.");
     let configurations = client.internal.get_api_configurations();
     let id_config = &configurations.identity_config;
-    let response = id_config
+    let mut request = id_config
         .client
         .post(format!("{}/connect/token", id_config.base_path))
         .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
-        .header("accept", "application/json")
-        .body(form.to_string())
-        .send()
-        .await
-        .map_err(|_| network())?;
+        .header("accept", "application/json");
+    if let Some(email) = auth_email {
+        request = request.header("auth-email", identity::auth_email_header(email));
+    }
+    let response = request.body(form.to_string()).send().await.map_err(|_| network())?;
     let status = response.status().as_u16();
     let text = Zeroizing::new(response.text().await.map_err(|_| network())?);
     Ok(identity::parse_token_answer(status, &text))

@@ -8,7 +8,7 @@
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_string_contains, method, path},
+    matchers::{body_string_contains, header, method, path},
 };
 use wren_vault::sdk::{Config, LoginOutcome, LoginRequest, Session};
 
@@ -63,6 +63,8 @@ async fn a_wrong_password_is_bad_credentials() {
         // the device is Wren's own: type 14 (a browser the server does not know by name), the name "Wren"
         .and(body_string_contains("deviceType=14"))
         .and(body_string_contains("deviceName=Wren"))
+        // the server refuses a password grant without the account's email in this header ("Auth-Email header invalid")
+        .and(header("auth-email", "dXNlckBleGFtcGxlLmNvbQ"))
         .respond_with(refused("Username or password is incorrect. Try again."))
         .expect(1)
         .mount(&server)

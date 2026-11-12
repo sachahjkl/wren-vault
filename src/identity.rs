@@ -45,6 +45,27 @@ pub fn provider_id(name: &str) -> Option<u8> {
     }
 }
 
+/// The `Auth-Email` header of a password login: the account's email in base64url without padding. The server refuses
+/// the password grant without it ("Auth-Email header invalid").
+pub fn auth_email_header(email: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = email.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
 /// The form of a password login. `hash`: the master password hash (the SDK's server authorization hash), never the
 /// password. The form is zeroed when it is dropped.
 pub fn password_form(email: &str, hash: &str, device: &Device, second: Option<&Second>) -> Zeroizing<String> {
@@ -262,6 +283,15 @@ mod tests {
         );
         assert_eq!(parse_token_answer(500, "<html>"), TokenAnswer::Unexpected);
         assert_eq!(parse_token_answer(200, "{}"), TokenAnswer::Unexpected);
+    }
+
+    #[test]
+    fn the_auth_email_header_is_base64url_without_padding() {
+        assert_eq!(auth_email_header("user@example.com"), "dXNlckBleGFtcGxlLmNvbQ");
+        assert_eq!(auth_email_header("a+b@c.d"), "YStiQGMuZA");
+        assert_eq!(auth_email_header("ab"), "YWI");
+        assert_eq!(auth_email_header("abc"), "YWJj");
+        assert_eq!(auth_email_header("\u{ff}\u{fe}"), "w7_Dvg");
     }
 
     #[test]
