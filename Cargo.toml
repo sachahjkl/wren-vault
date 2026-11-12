@@ -1,0 +1,60 @@
+[package]
+name = "wren-vault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-only"
+description = "The Vault helper of the Wren browser: a client for Bitwarden® accounts, behind a pipe protocol"
+publish = false
+
+# The helper is its own program and its own work. It links the Bitwarden SDK (sdk-internal) under GPL-3.0-only. It
+# contains no code of Wren. Wren starts it and talks to it through the pipe protocol of README.md.
+
+[lib]
+name = "wren_vault"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wren-vault"
+path = "src/main.rs"
+
+# Every SDK crate comes from one exact revision of https://github.com/bitwarden/sdk-internal (README.md, "SDK revision").
+# Default features only: never `wasm`, `uniffi`, `bitwarden-license`, `no-memory-hardening`, `dangerous-crypto-debug` or
+# `debug-capabilities`. bitwarden-crypto installs the zeroizing global allocator of this program.
+[dependencies]
+bitwarden-api-api = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-auth = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-core = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7", features = ["internal"] }
+bitwarden-crypto = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-crypto-sync-handler = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-sync = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+bitwarden-vault = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "io-std", "io-util", "sync", "macros"] }
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+zeroize = "1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.177"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+wiremock = "0.6.5"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+
+# `quick` (wrentool build vault -Profile quick): what a developer rebuilds while working on Wren's side.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 1
