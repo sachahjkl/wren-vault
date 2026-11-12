@@ -2248,7 +2248,8 @@ async fn sync_capture(client: &Client) -> Result<Captured, Failure> {
         exclude_subdomains: Some(false),
     })
     .await
-    .map_err(|_| Failure::new("sync_failed", "The vault could not be synced with the server."))?;
+    // (the SDK's own words: why the server or the answer failed; they hold no secret)
+    .map_err(|e| Failure::new("sync_failed", format!("The vault could not be synced with the server: {e}.")))?;
     let got = capture.got.lock().ok().and_then(|mut g| g.take());
     got.ok_or_else(|| Failure::new("sync_failed", "The server sent no vault."))
 }
