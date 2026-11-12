@@ -80,8 +80,19 @@ pub enum Op {
         #[serde(default)]
         domain: String,
     },
-    /// The values of one login, for a fill that the user asked for.
+    /// The logins whose name, user name or address hold every word of `query` (the browser's command palette). No
+    /// password, no code.
+    Search {
+        query: String,
+        /// The most rows to return (0: the helper's own bound).
+        #[serde(default)]
+        limit: usize,
+    },
+    /// The values of one login, for a fill or a copy that the user asked for: `fields` lists "username", "password",
+    /// "totp" (the current code).
     Fill { item: String, fields: Vec<String> },
+    /// The current code of one login's TOTP key, and the seconds it stays valid.
+    Totp { item: String },
     /// The user is active: the idle deadline starts again. No answer.
     Keepalive,
 }
@@ -124,25 +135,28 @@ pub fn event(name: &str) -> Value {
     json!({ "id": 0, "ok": true, "event": name })
 }
 
-/// One row of `logins_for`: what the browser shows. No password.
+/// One row of `logins_for` or `search`: what the browser shows. No password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
     pub name: String,
     pub username: String,
-    /// The saved URI that matched.
+    /// The saved URI that matched (`logins_for`), or the item's first web address (`search`; "" when it has none).
     pub uri: String,
-    /// How it matched: "domain" or "host".
+    /// How it matched: "domain", "host", "equivalent", "starts_with" or "exact"; "" for a `search` row.
     pub matched: &'static str,
     pub has_totp: bool,
 }
 
 impl Row {
     pub fn to_json(&self) -> Value {
-        json!({
-            "id": self.id, "name": self.name, "username": self.username, "uri": self.uri,
-            "match": self.matched, "has_totp": self.has_totp,
-        })
+        let mut v = json!({
+            "id": self.id, "name": self.name, "username": self.username, "uri": self.uri, "has_totp": self.has_totp,
+        });
+        if let (false, Some(o)) = (self.matched.is_empty(), v.as_object_mut()) {
+            o.insert("match".into(), json!(self.matched));
+        }
+        v
     }
 }
 
@@ -189,6 +203,10 @@ mod tests {
         ));
         let r: Request = serde_json::from_str(r#"{"id":8,"op":"pin_set","pin":"1234"}"#).unwrap();
         assert!(matches!(r.op, Op::PinSet { .. }));
+        let r: Request = serde_json::from_str(r#"{"id":10,"op":"search","query":"git"}"#).unwrap();
+        assert!(matches!(r.op, Op::Search { limit: 0, .. }));
+        let r: Request = serde_json::from_str(r#"{"id":11,"op":"totp","item":"x"}"#).unwrap();
+        assert!(matches!(r.op, Op::Totp { .. }));
         for op in ["pin_clear", "logout", "keepalive", "sync"] {
             let text = format!(r#"{{"id":9,"op":"{op}"}}"#);
             assert!(serde_json::from_str::<Request>(&text).is_ok(), "{op}");
@@ -209,6 +227,15 @@ mod tests {
         let e = error(8, "bad_password", "The master password is wrong.");
         assert_eq!(e["ok"], false);
         assert_eq!(e["error"], "bad_password");
+        let row = Row {
+            id: "1".into(),
+            name: "A".into(),
+            username: "me".into(),
+            uri: "https://a.example".into(),
+            matched: "",
+            has_totp: true,
+        };
+        assert!(row.to_json().get("match").is_none(), "a search row has no match type");
         let ev = event("locked");
         assert_eq!(ev["id"], 0);
         assert_eq!(ev["event"], "locked");

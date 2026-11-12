@@ -381,8 +381,19 @@ async fn sync_fill_and_pins_need_an_unlocked_vault() {
     let server = MockServer::start().await;
     let mut s = session_for(&server);
     assert_eq!(s.sync().await.err().map(|e| e.code), Some("locked"));
-    assert_eq!(s.fill("id", true, true).await.err().map(|e| e.code), Some("locked"));
+    assert_eq!(
+        s.fill("id", true, true, false).await.err().map(|e| e.code),
+        Some("locked")
+    );
+    assert_eq!(
+        s.fill("id", false, false, true).await.err().map(|e| e.code),
+        Some("locked")
+    );
+    assert_eq!(s.search("git", 0).await.err().map(|e| e.code), Some("locked"));
+    assert_eq!(s.totp("id").await.err().map(|e| e.code), Some("locked"));
     assert_eq!(s.pin_set("1234").err().map(|e| e.code), Some("locked"));
+    // (a locked vault asks the server nothing: no request reached the mock)
+    assert!(server.received_requests().await.unwrap_or_default().is_empty());
     assert_eq!(
         s.unlock(wren_vault::sdk::Unlock::Password("password"))
             .await

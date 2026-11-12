@@ -20,6 +20,9 @@ pub struct Page<'a> {
     pub host: &'a str,
     /// The registrable domain of `host` ("" when it has none: an IP address, localhost, a public suffix).
     pub domain: &'a str,
+    /// The domains that the account makes equivalent to `domain` (its own groups and the server's global ones that
+    /// hold it), lower case; empty when none.
+    pub equivalent: &'a [String],
 }
 
 /// The URI as the user saved it, made absolute: a URI without a scheme is read as https.
@@ -35,8 +38,14 @@ fn parse_saved(uri: &str) -> Option<Url> {
     }
 }
 
-/// Whether a URI saved with rule `rule` matches the page, and the name of the rule that matched. Phase 1 knows
-/// `Domain` and `Host`; the other rules match nothing.
+/// Whether `host` is `domain` or one of its subdomains (both lower case).
+fn inside(host: &str, domain: &str) -> bool {
+    !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Whether a URI saved with rule `rule` matches the page, and the name of the rule that matched: "domain", "host",
+/// "equivalent" (a domain that the account makes equivalent to the page's), "starts_with" or "exact".
+/// `RegularExpression` and `Never` match nothing.
 pub fn matches(page: &Page, saved: &str, rule: Rule) -> Option<&'static str> {
     let Ok(frame) = Url::parse(page.url) else { return None };
     if frame.scheme() != "https" && frame.scheme() != "http" {
@@ -55,13 +64,51 @@ pub fn matches(page: &Page, saved: &str, rule: Rule) -> Option<&'static str> {
     let same_host_and_port = || saved_host == host && saved.port_or_known_default() == frame.port_or_known_default();
     match rule {
         Rule::Domain if !page.domain.is_empty() => {
-            let domain = page.domain.to_ascii_lowercase();
-            let inside = saved_host == domain || saved_host.ends_with(&format!(".{domain}"));
-            inside.then_some("domain")
+            if inside(&saved_host, &page.domain.to_ascii_lowercase()) {
+                return Some("domain");
+            }
+            page.equivalent
+                .iter()
+                .any(|e| inside(&saved_host, &e.to_ascii_lowercase()))
+                .then_some("equivalent")
         }
         Rule::Domain | Rule::Host => same_host_and_port().then_some("host"),
-        Rule::StartsWith | Rule::Exact | Rule::RegularExpression | Rule::Never => None,
+        // (both sides serialized by the URL standard: the browser compares the same strings)
+        Rule::StartsWith => frame.as_str().starts_with(saved.as_str()).then_some("starts_with"),
+        Rule::Exact => (frame.as_str() == saved.as_str()).then_some("exact"),
+        Rule::RegularExpression | Rule::Never => None,
     }
+}
+
+/// The domains equivalent to `domain` in the account's groups: every domain of each group that holds it, except
+/// `domain` itself. Lower case, without duplicates.
+pub fn equivalent_of(groups: &[Vec<String>], domain: &str) -> Vec<String> {
+    let domain = domain.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    if domain.is_empty() {
+        return out;
+    }
+    for g in groups {
+        if !g.iter().any(|d| d.eq_ignore_ascii_case(&domain)) {
+            continue;
+        }
+        for d in g {
+            let d = d.trim().to_ascii_lowercase();
+            if !d.is_empty() && d != domain && !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Whether every word of `query` (split on white space, case aside) is in one of `texts`. An empty query matches.
+pub fn search_matches(query: &str, texts: &[&str]) -> bool {
+    let lower: Vec<String> = texts.iter().map(|t| t.to_lowercase()).collect();
+    query.split_whitespace().all(|w| {
+        let w = w.to_lowercase();
+        lower.iter().any(|t| t.contains(&w))
+    })
 }
 
 #[cfg(test)]
@@ -69,7 +116,12 @@ mod tests {
     use super::*;
 
     fn page<'a>(url: &'a str, host: &'a str, domain: &'a str) -> Page<'a> {
-        Page { url, host, domain }
+        Page {
+            url,
+            host,
+            domain,
+            equivalent: &[],
+        }
     }
 
     #[test]
@@ -104,14 +156,63 @@ mod tests {
         let p = page("http://example.com/", "example.com", "example.com");
         assert_eq!(matches(&p, "https://example.com", Rule::Domain), None);
         assert_eq!(matches(&p, "http://example.com", Rule::Domain), Some("domain"));
+        assert_eq!(matches(&p, "https://example.com/", Rule::StartsWith), None);
     }
 
     #[test]
-    fn other_rules_match_nothing_in_phase_1() {
+    fn starts_with_and_exact_compare_the_serialized_addresses() {
+        let p = page("https://example.com/login?next=1", "example.com", "example.com");
+        assert_eq!(
+            matches(&p, "https://example.com/login", Rule::StartsWith),
+            Some("starts_with")
+        );
+        assert_eq!(
+            matches(&p, "https://EXAMPLE.com", Rule::StartsWith),
+            Some("starts_with")
+        );
+        assert_eq!(matches(&p, "https://example.com/signup", Rule::StartsWith), None);
+        assert_eq!(
+            matches(&p, "https://example.com/login?next=1", Rule::Exact),
+            Some("exact")
+        );
+        assert_eq!(matches(&p, "https://example.com/login", Rule::Exact), None);
+    }
+
+    #[test]
+    fn never_and_regular_expressions_match_nothing() {
         let p = page("https://example.com/", "example.com", "example.com");
-        for r in [Rule::StartsWith, Rule::Exact, Rule::RegularExpression, Rule::Never] {
+        for r in [Rule::RegularExpression, Rule::Never] {
             assert_eq!(matches(&p, "https://example.com/", r), None);
         }
+    }
+
+    #[test]
+    fn equivalent_domains_extend_the_domain_rule_only() {
+        let groups = vec![
+            vec![
+                "google.com".to_string(),
+                "youtube.com".to_string(),
+                "gmail.com".to_string(),
+            ],
+            vec!["example.org".to_string(), "example.net".to_string()],
+        ];
+        let eq = equivalent_of(&groups, "YouTube.com");
+        assert_eq!(eq, vec!["google.com".to_string(), "gmail.com".to_string()]);
+        assert!(equivalent_of(&groups, "other.com").is_empty());
+        assert!(equivalent_of(&groups, "").is_empty());
+        let p = Page {
+            url: "https://www.youtube.com/",
+            host: "www.youtube.com",
+            domain: "youtube.com",
+            equivalent: &eq,
+        };
+        assert_eq!(
+            matches(&p, "https://accounts.google.com", Rule::Domain),
+            Some("equivalent")
+        );
+        assert_eq!(matches(&p, "https://youtube.com", Rule::Domain), Some("domain"));
+        assert_eq!(matches(&p, "https://accounts.google.com", Rule::Host), None);
+        assert_eq!(matches(&p, "https://example.org", Rule::Domain), None);
     }
 
     #[test]
@@ -120,5 +221,13 @@ mod tests {
         assert_eq!(matches(&p, "androidapp://com.example", Rule::Domain), None);
         let f = page("file:///tmp/a.html", "", "");
         assert_eq!(matches(&f, "https://example.com", Rule::Domain), None);
+    }
+
+    #[test]
+    fn a_search_needs_every_word_somewhere() {
+        assert!(search_matches("", &["GitHub"]));
+        assert!(search_matches("git me", &["GitHub", "me@example.com"]));
+        assert!(!search_matches("git bank", &["GitHub", "me@example.com"]));
+        assert!(search_matches("ÉCOLE", &["école.fr"]));
     }
 }

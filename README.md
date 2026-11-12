@@ -40,9 +40,13 @@ files must be present (the Nix flake provides them).
 
 ## Protocol
 
-Version 2 (this helper 0.2.0). Changes from version 1: `login` carries `code` and `provider` instead of `totp`, and
-answers `need_device_code`; new requests `login_api_key`, `logout`, `pin_set`, `pin_clear`; `unlock` takes `pin`;
-`hello` takes `idle_seconds` and answers `login` and `pin`; the event `locked`.
+Version 3 (this helper 0.3.0). Changes from version 2: new requests `search` and `totp`; `fill` takes the field
+`"totp"`; `logins_for` applies the rules `StartsWith` and `Exact` and the account's equivalent domains, its rows carry
+the match types `equivalent`, `starts_with` and `exact`, and its answer carries `equivalent`; the error `no_totp`.
+
+Version 2 (helper 0.2.0) changed from version 1: `login` carries `code` and `provider` instead of `totp`, and answers
+`need_device_code`; new requests `login_api_key`, `logout`, `pin_set`, `pin_clear`; `unlock` takes `pin`; `hello`
+takes `idle_seconds` and answers `login` and `pin`; the event `locked`.
 
 ### Frames
 
@@ -70,7 +74,7 @@ request but `hello` needs a `hello` before it (`no_hello`).
 
 | op | Request fields | Answer fields |
 |---|---|---|
-| `hello` | `protocol` (2), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool) |
+| `hello` | `protocol` (3), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool) |
 | `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true) | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
 | `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email` |
 | `unlock` | `password` or `pin` | none; a `bad_pin` error carries `tries_left` |
@@ -79,8 +83,10 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
 | `pin_set` | `pin` (4 characters or more) | none |
 | `pin_clear` | none | none |
-| `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp}` |
-| `fill` | `item` (a row id), `fields` (a list of `"username"`, `"password"`) | `username`, `password` (only the asked fields that the item has) |
+| `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp}`; `equivalent`: the domains that the account makes equivalent to `domain` |
+| `search` | `query` (words), `limit` (0: 50; never more than 50) | `rows`: `{id, name, username, uri, has_totp}`, sorted by name; `uri` is the item's first `http` or `https` address (`""` if none) |
+| `fill` | `item` (a row id), `fields` (a list of `"username"`, `"password"`, `"totp"`) | `username`, `password` (only the asked fields that the item has), `totp` (the current code) |
+| `totp` | `item` | `totp` (the current code), `period` and `remaining` (seconds) |
 | `keepalive` | none | no answer; the idle deadline starts again |
 
 ### Login steps
@@ -126,7 +132,8 @@ its own timer, and sends `keepalive` while the person is active.
 | `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
-| `no_item` | `fill` names an item that is not a login of the vault. |
+| `no_item` | `fill` or `totp` names an item that is not a login of the vault. |
+| `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
 | `decrypt` | The item cannot be decrypted, or the PIN cannot be set. |
 | `state_write`, `state_format` | The state directory (or the token store) cannot be written, or the saved state cannot be read. |
 
@@ -134,14 +141,26 @@ its own timer, and sends `keepalive` while the person is active.
 
 `logins_for` returns the logins with a saved URI that matches the page:
 
-- `Domain` (the default): the URI's host is the page's registrable domain, or a subdomain of it. If the page has no
-  registrable domain (an IP address, `localhost`, a public suffix), the `Host` rule applies.
+- `Domain` (the default): the URI's host is the page's registrable domain, or a subdomain of it (match `domain`); or
+  the URI's host is one of the domains that the account makes equivalent to it, or a subdomain of one (match
+  `equivalent`). If the page has no registrable domain (an IP address, `localhost`, a public suffix), the `Host` rule
+  applies.
 - `Host`: the same host and the same port.
-- `StartsWith`, `Exact`, `RegularExpression`, `Never`: no match in this version.
+- `StartsWith`: the page's address starts with the saved URI. `Exact`: the page's address is the saved URI. Both
+  addresses are compared as the URL standard serializes them.
+- `RegularExpression`, `Never`: no match.
 - An item saved for `https` never matches an `http` page. A URI without a scheme is read as `https`.
 
-The helper has no Public Suffix List. The browser sends the registrable domain, and it checks every row again with its
-own list before it shows it.
+Equivalent domains: the account's own groups, then the server's global groups that the account did not exclude, as the
+last sync gave them (kept in the state as `equivalent_domains`). The helper has no Public Suffix List. The browser
+sends the registrable domain, and it checks every row again with its own list before it shows it; for an `equivalent`
+row it checks that the saved host's registrable domain is in the answer's `equivalent`.
+
+`search` matches each word of the query, case aside, in the item's name, user name or one of its URIs. It returns no
+password and no code: a palette shows its rows.
+
+TOTP codes are the SDK's (`generate_totp`): an `otpauth://` URI, a `steam://` URI or a base32 secret; SHA-1, SHA-256 or
+SHA-512; the key's digits and period.
 
 ## Device
 
@@ -187,6 +206,7 @@ written: the account is forgotten when the helper exits. Version 2 of the file; 
 | `ciphers` | The items as the server sends them, encrypted. |
 | `pin_envelope`, `pin_failures` | The user key sealed by the PIN (the SDK's PIN envelope), and the wrong PINs since the last good one. |
 | `last_sync` | Time of the last sync. |
+| `equivalent_domains` | The groups of equivalent domains of the last sync (public). |
 
 Nothing in the file opens the vault without the master password or the PIN.
 
@@ -213,8 +233,8 @@ fifth one in a row deletes the envelope (`pin_reset`). A new login starts withou
 
 ## Tests
 
-- `cargo test`: the frame codec, the protocol, the idle deadline (on tokio's paused clock), the matching rules, the
-  state file, the token store and its file fallback (with a fake system store), the PIN try counter, the form of the
+- `cargo test`: the frame codec, the protocol, the idle deadline (on tokio's paused clock), the matching rules (the
+  equivalent domains and the search included), the TOTP codes (RFC 6238's vectors), the state file, the token store and its file fallback (with a fake system store), the PIN try counter, the form of the
   token request, and the login against a wiremock server on loopback (wrong password, the authenticator and email
   second steps, the new-device code, the API key, no server). No test contacts a real server.
 - A successful login needs fixtures made once from a test account (prelogin, token and sync answers). They are not in

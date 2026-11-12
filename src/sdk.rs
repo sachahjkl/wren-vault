@@ -30,7 +30,7 @@ use bitwarden_core::{
 use bitwarden_crypto::{Kdf, UnsignedSharedKey, safe::PasswordProtectedKeyEnvelope};
 use bitwarden_crypto_sync_handler::CryptoSyncData;
 use bitwarden_sync::{SyncClientExt, SyncHandler, SyncHandlerError, SyncRequest};
-use bitwarden_vault::{Cipher, CipherType, CipherView, UriMatchType, VaultClientExt};
+use bitwarden_vault::{Cipher, CipherType, CipherView, UriMatchType, VaultClientExt, generate_totp};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -127,23 +127,38 @@ pub enum Unlock<'a> {
     Pin(&'a str),
 }
 
-/// The values of one login for a fill. Zeroed when dropped.
+/// The values of one login for a fill or a copy. Zeroed when dropped.
 #[derive(Default)]
 pub struct Values {
     pub username: Option<String>,
     pub password: Option<String>,
+    /// The current code of the login's TOTP key.
+    pub totp: Option<String>,
 }
 
 impl Drop for Values {
     fn drop(&mut self) {
-        if let Some(u) = &mut self.username {
-            u.zeroize();
-        }
-        if let Some(p) = &mut self.password {
-            p.zeroize();
+        for v in [&mut self.username, &mut self.password, &mut self.totp]
+            .into_iter()
+            .flatten()
+        {
+            v.zeroize();
         }
     }
 }
+
+/// A TOTP code and how long it stays valid.
+pub struct Code {
+    pub code: Zeroizing<String>,
+    /// The key's period, in seconds.
+    pub period: u32,
+    /// The seconds left in the current period (1 to `period`).
+    pub remaining: u32,
+}
+
+/// The most rows that `search` returns when the browser names no bound, and the most it ever returns: the browser
+/// shows them in its palette, which needs a short list.
+pub const SEARCH_LIMIT: usize = 50;
 
 /// A password login that waits for its second step: what the next `login` needs.
 struct Waiting {
@@ -180,6 +195,8 @@ pub struct Session {
     client: Option<Client>,
     /// The encrypted items of the last sync.
     ciphers: Vec<Cipher>,
+    /// The account's groups of equivalent domains, from the last sync.
+    domains: Vec<Vec<String>>,
     /// A login that waits for its second step.
     waiting: Option<Waiting>,
     /// The secrets last written to the token store (they are written again only when they change).
@@ -195,6 +212,7 @@ impl Default for Session {
             saved: None,
             client: None,
             ciphers: Vec::new(),
+            domains: Vec::new(),
             waiting: None,
             secrets: None,
         }
@@ -567,6 +585,7 @@ impl Session {
         };
         self.secrets = None;
         self.ciphers = captured.ciphers;
+        self.domains = captured.domains;
         self.client = Some(client);
         self.remember(&mut saved, captured.org_keys).await?;
         Ok(email)
@@ -649,6 +668,7 @@ impl Session {
             .iter()
             .filter_map(|c| serde_json::from_value(c.clone()).ok())
             .collect();
+        self.domains = saved.equivalent_domains.clone();
         self.client = Some(client);
         self.secrets = Some(secrets);
         self.saved = Some(saved);
@@ -698,6 +718,7 @@ impl Session {
         self.forget_waiting();
         self.client = None;
         self.ciphers.clear();
+        self.domains.clear();
         self.secrets = None;
         if let Some(old) = self.saved.take().or_else(|| self.store.load()) {
             let tokens = self.tokens.clone();
@@ -724,6 +745,7 @@ impl Session {
             saved.account_crypto = to_value(account_crypto)?;
         }
         self.ciphers = captured.ciphers;
+        self.domains = captured.domains;
         self.remember(&mut saved, captured.org_keys).await?;
         Ok((self.ciphers.len(), saved.last_sync))
     }
@@ -749,6 +771,7 @@ impl Session {
             client_secret,
         };
         saved.org_keys = org_keys;
+        saved.equivalent_domains = self.domains.clone();
         saved.ciphers = self
             .ciphers
             .iter()
@@ -792,7 +815,13 @@ impl Session {
             .collect())
     }
 
-    /// `logins_for`: the rows of the logins whose URIs match the page. No password.
+    /// The domains equivalent to a page's registrable domain (`matching::equivalent_of` over the account's groups).
+    pub fn equivalent_of(&self, domain: &str) -> Vec<String> {
+        matching::equivalent_of(&self.domains, domain)
+    }
+
+    /// `logins_for`: the rows of the logins whose URIs match the page. No password. `page.equivalent` comes from
+    /// `equivalent_of`.
     pub async fn logins_for(&self, page: &Page<'_>) -> Result<Vec<Row>, Failure> {
         let mut rows = Vec::new();
         for view in self.views().await? {
@@ -823,8 +852,53 @@ impl Session {
         Ok(rows)
     }
 
-    /// `fill`: the values of one item that the user picked.
-    pub async fn fill(&self, item: &str, want_username: bool, want_password: bool) -> Result<Values, Failure> {
+    /// `search`: the logins whose name, user name or addresses hold every word of `query`, sorted by name, at most
+    /// `limit` (0 or more than `SEARCH_LIMIT`: `SEARCH_LIMIT`). No password.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Row>, Failure> {
+        let limit = if limit == 0 {
+            SEARCH_LIMIT
+        } else {
+            limit.min(SEARCH_LIMIT)
+        };
+        let mut rows = Vec::new();
+        for view in self.views().await? {
+            let Some(id) = view.id.map(|i| i.to_string()) else {
+                continue;
+            };
+            let Some(login) = &view.login else { continue };
+            let uris: Vec<&str> = login.uris.iter().flatten().filter_map(|u| u.uri.as_deref()).collect();
+            let username = login.username.clone().unwrap_or_default();
+            let mut texts = vec![view.name.as_str(), username.as_str()];
+            texts.extend(uris.iter().copied());
+            if !matching::search_matches(query, &texts) {
+                continue;
+            }
+            let web = uris
+                .iter()
+                .find(|u| {
+                    matches!(
+                        url::Url::parse(u).map(|p| p.scheme().to_string()).as_deref(),
+                        Ok("https") | Ok("http")
+                    )
+                })
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            rows.push(Row {
+                id,
+                name: view.name.clone(),
+                username,
+                uri: web,
+                matched: "",
+                has_totp: login.totp.is_some(),
+            });
+        }
+        rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// The decrypted login of one item.
+    async fn login_view(&self, item: &str) -> Result<CipherView, Failure> {
         let client = self.client.as_ref().ok_or_else(locked)?;
         let cipher = self
             .ciphers
@@ -838,11 +912,25 @@ impl Session {
             .decrypt(cipher)
             .await
             .map_err(|_| Failure::new("decrypt", "The item cannot be decrypted."))?;
-        let login = view
-            .login
-            .as_ref()
-            .filter(|_| view.deleted_date.is_none())
-            .ok_or_else(|| Failure::new("no_item", "The item is not a login."))?;
+        if view.deleted_date.is_some() || view.login.is_none() {
+            return Err(Failure::new("no_item", "The item is not a login."));
+        }
+        Ok(view)
+    }
+
+    /// `fill`: the values of one item that the user picked. A wanted TOTP code that the item cannot give is an error
+    /// (`no_totp`): the browser asked for it because the row said the item has one.
+    pub async fn fill(
+        &self,
+        item: &str,
+        want_username: bool,
+        want_password: bool,
+        want_totp: bool,
+    ) -> Result<Values, Failure> {
+        let view = self.login_view(item).await?;
+        let Some(login) = view.login.as_ref() else {
+            return Err(Failure::new("no_item", "The item is not a login."));
+        };
         let mut values = Values::default();
         if want_username {
             values.username = login.username.clone();
@@ -850,8 +938,41 @@ impl Session {
         if want_password {
             values.password = login.password.clone();
         }
+        if want_totp {
+            let code = totp_now(login.totp.as_deref())?;
+            values.totp = Some(code.code.to_string());
+        }
         Ok(values)
     }
+
+    /// `totp`: the current code of one item's TOTP key, computed by the SDK.
+    pub async fn totp(&self, item: &str) -> Result<Code, Failure> {
+        let view = self.login_view(item).await?;
+        totp_now(view.login.as_ref().and_then(|l| l.totp.as_deref()))
+    }
+}
+
+/// The code of a TOTP key now (an otpauth:// URI, a steam:// URI or a base32 secret; the SDK reads all three).
+fn totp_now(key: Option<&str>) -> Result<Code, Failure> {
+    let key = key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| Failure::new("no_totp", "This login has no TOTP key."))?;
+    let now = chrono::Utc::now();
+    totp_at(key, now)
+}
+
+/// The code of `key` at `at`, and the seconds left in its period.
+pub fn totp_at(key: &str, at: chrono::DateTime<chrono::Utc>) -> Result<Code, Failure> {
+    let answer = generate_totp(key.to_string(), Some(at))
+        .map_err(|_| Failure::new("no_totp", "The login's TOTP key cannot be read."))?;
+    let period = answer.period.max(1);
+    let remaining = period - (at.timestamp().rem_euclid(i64::from(period)) as u32);
+    Ok(Code {
+        code: Zeroizing::new(answer.code),
+        period,
+        remaining,
+    })
 }
 
 /// A wrong PIN: counted in the state; at `PIN_TRIES` the envelope goes and only the master password unlocks.
@@ -984,13 +1105,15 @@ async fn init_organizations(client: &Client, keys: &[(String, String)]) {
     }
 }
 
-/// What a sync gives the helper: the encrypted items, the account's key data, the organization keys, the email.
+/// What a sync gives the helper: the encrypted items, the account's key data, the organization keys, the email, the
+/// groups of equivalent domains.
 #[derive(Default)]
 struct Captured {
     ciphers: Vec<Cipher>,
     crypto: CryptoSyncData,
     org_keys: Vec<(String, String)>,
     email: Option<String>,
+    domains: Vec<Vec<String>>,
 }
 
 /// A sync handler that keeps the response's parts that the helper stores.
@@ -1018,6 +1141,7 @@ impl SyncHandler for Capture {
             }
         }
         let email = response.profile.as_deref().and_then(|p| p.email.clone());
+        let domains = response.domains.as_deref().map(domain_groups).unwrap_or_default();
         *self
             .got
             .lock()
@@ -1026,9 +1150,24 @@ impl SyncHandler for Capture {
             crypto,
             org_keys,
             email,
+            domains,
         });
         Ok(())
     }
+}
+
+/// The account's own groups of equivalent domains, then the server's global groups that the account did not exclude.
+fn domain_groups(d: &bitwarden_api_api::models::DomainsResponseModel) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = d.equivalent_domains.clone().unwrap_or_default();
+    for g in d.global_equivalent_domains.iter().flatten() {
+        if g.excluded != Some(true)
+            && let Some(list) = &g.domains
+        {
+            out.push(list.clone());
+        }
+    }
+    out.retain(|g| g.len() > 1);
+    out
 }
 
 /// A full sync through the SDK, with the capture handler (the SDK makes a new sync client, with no handler, per call).
@@ -1036,9 +1175,10 @@ async fn sync_capture(client: &Client) -> Result<Captured, Failure> {
     let capture = Arc::new(Capture::default());
     let sync = client.sync();
     sync.register_sync_handler(capture.clone());
+    // (`exclude_subdomains` is the API's `excludeDomains`: false, the answer carries the equivalent domains)
     sync.sync(SyncRequest {
         force: true,
-        exclude_subdomains: Some(true),
+        exclude_subdomains: Some(false),
     })
     .await
     .map_err(|_| Failure::new("sync_failed", "The vault could not be synced with the server."))?;
@@ -1058,6 +1198,47 @@ mod tests {
         assert!(!server_url_allowed("http://example.com"));
         assert!(!server_url_allowed("ftp://example.com"));
         assert!(!server_url_allowed("not a url"));
+    }
+
+    // RFC 6238's SHA-1 vector (the secret "12345678901234567890" in base32), cut to the SDK's 6 digits
+    #[test]
+    fn totp_codes_come_from_the_sdk_with_the_time_left() {
+        let key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let at = chrono::DateTime::from_timestamp(59, 0).unwrap();
+        let c = totp_at(key, at).unwrap();
+        assert_eq!(c.code.as_str(), "287082");
+        assert_eq!(c.period, 30);
+        assert_eq!(c.remaining, 1);
+        let at = chrono::DateTime::from_timestamp(1_111_111_109, 0).unwrap();
+        let c = totp_at(&format!("otpauth://totp/x?secret={key}"), at).unwrap();
+        assert_eq!(c.code.as_str(), "081804");
+        assert_eq!(c.remaining, 1);
+        assert_eq!(totp_now(None).err().map(|f| f.code), Some("no_totp"));
+        assert_eq!(totp_now(Some("  ")).err().map(|f| f.code), Some("no_totp"));
+    }
+
+    #[test]
+    fn equivalent_domains_come_from_the_account_and_the_unexcluded_global_groups() {
+        use bitwarden_api_api::models::{DomainsResponseModel, GlobalDomains};
+        let mut d = DomainsResponseModel::new();
+        d.equivalent_domains = Some(vec![
+            vec!["a.example".into(), "b.example".into()],
+            vec!["alone.example".into()],
+        ]);
+        let mut kept = GlobalDomains::new();
+        kept.domains = Some(vec!["google.com".into(), "youtube.com".into()]);
+        kept.excluded = Some(false);
+        let mut excluded = GlobalDomains::new();
+        excluded.domains = Some(vec!["apple.com".into(), "icloud.com".into()]);
+        excluded.excluded = Some(true);
+        d.global_equivalent_domains = Some(vec![kept, excluded]);
+        let groups = domain_groups(&d);
+        assert_eq!(
+            groups.len(),
+            2,
+            "a group of one domain and an excluded group are left out"
+        );
+        assert_eq!(groups[1], vec!["google.com".to_string(), "youtube.com".to_string()]);
     }
 
     #[test]

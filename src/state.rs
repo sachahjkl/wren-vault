@@ -50,6 +50,10 @@ pub struct Saved {
     pub ciphers: Vec<Value>,
     /// Unix time of the last sync, in seconds.
     pub last_sync: i64,
+    /// The account's groups of equivalent domains (its own and the server's global ones that it did not exclude), as
+    /// the last sync gave them. Public: the server's list is the same for every account.
+    #[serde(default)]
+    pub equivalent_domains: Vec<Vec<String>>,
     /// The user key sealed by the PIN (the SDK's PIN envelope); null when no PIN is set.
     #[serde(default)]
     pub pin_envelope: Value,

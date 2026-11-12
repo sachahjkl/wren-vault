@@ -209,36 +209,55 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             Err(f) => fail(f),
         },
         Op::LoginsFor { url, host, domain } => {
+            let equivalent = session.equivalent_of(&domain);
             let page = Page {
                 url: &url,
                 host: &host,
                 domain: &domain,
+                equivalent: &equivalent,
             };
             match session.logins_for(&page).await {
                 Ok(rows) => {
                     let rows: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
-                    done(json!({ "rows": rows }))
+                    // (the browser checks an "equivalent" row against this list: it has no copy of the account's groups)
+                    done(json!({ "rows": rows, "equivalent": equivalent }))
                 }
                 Err(f) => fail(f),
             }
         }
+        Op::Search { query, limit } => match session.search(&query, limit).await {
+            Ok(rows) => {
+                let rows: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+                done(json!({ "rows": rows }))
+            }
+            Err(f) => fail(f),
+        },
         Op::Fill { item, fields } => {
-            let want_username = fields.iter().any(|f| f == "username");
-            let want_password = fields.iter().any(|f| f == "password");
-            match session.fill(&item, want_username, want_password).await {
+            let want = |name: &str| fields.iter().any(|f| f == name);
+            match session
+                .fill(&item, want("username"), want("password"), want("totp"))
+                .await
+            {
                 Ok(values) => {
                     let mut body = serde_json::Map::new();
-                    if let Some(u) = &values.username {
-                        body.insert("username".into(), Value::String(u.clone()));
-                    }
-                    if let Some(p) = &values.password {
-                        body.insert("password".into(), Value::String(p.clone()));
+                    for (key, v) in [
+                        ("username", &values.username),
+                        ("password", &values.password),
+                        ("totp", &values.totp),
+                    ] {
+                        if let Some(v) = v {
+                            body.insert(key.into(), Value::String(v.clone()));
+                        }
                     }
                     done(Value::Object(body))
                 }
                 Err(f) => fail(f),
             }
         }
+        Op::Totp { item } => match session.totp(&item).await {
+            Ok(c) => done(json!({ "totp": c.code.as_str(), "period": c.period, "remaining": c.remaining })),
+            Err(f) => fail(f),
+        },
         Op::Keepalive => (None, Next::Continue),
     }
 }
@@ -269,7 +288,7 @@ mod tests {
     }
 
     fn hello(id: u64, dir: &str, idle_seconds: u64) -> Value {
-        json!({"id": id, "op": "hello", "protocol": 2, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
+        json!({"id": id, "op": "hello", "protocol": 3, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
                "api_url": "http://127.0.0.1:9/api", "persist": !dir.is_empty(), "idle_seconds": idle_seconds})
     }
 
@@ -295,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remote_http_server_is_refused() {
-        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 2, "state_dir": "",
+        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 3, "state_dir": "",
             "identity_url": "http://example.com/identity", "api_url": "https://example.com/api"})])
         .await;
         assert_eq!(answers[0]["error"], "bad_server");
@@ -320,8 +339,14 @@ mod tests {
             json!({"id": 5, "op": "unlock", "pin": "1234"}),
             json!({"id": 6, "op": "pin_set", "pin": "1234"}),
             json!({"id": 7, "op": "unlock"}),
+            json!({"id": 8, "op": "search", "query": "git"}),
+            json!({"id": 9, "op": "totp", "item": "x"}),
+            json!({"id": 10, "op": "fill", "item": "x", "fields": ["totp"]}),
         ])
         .await;
+        assert_eq!(answers[7]["error"], "locked");
+        assert_eq!(answers[8]["error"], "locked");
+        assert_eq!(answers[9]["error"], "locked");
         assert_eq!(answers[1]["error"], "locked");
         assert_eq!(answers[2]["error"], "locked");
         assert_eq!(answers[3]["error"], "no_account");
