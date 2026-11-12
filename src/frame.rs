@@ -1,7 +1,7 @@
 //! Frames on the pipes: a 4-byte little-endian length, then that many bytes of one JSON object.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// The largest frame in either direction. A larger length ends the connection: the peer is broken or hostile.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -48,6 +48,52 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Zeroizing<Vec
     }
 }
 
+/// Reads frames as `read_frame` does, but can be dropped at any await and called again without losing bytes (the
+/// bytes read so far stay in its buffer): the server waits on it and on the idle deadline at once. Its buffer is zeroed
+/// as frames leave it and when it is dropped.
+#[derive(Default)]
+pub struct FrameReader {
+    buf: Zeroizing<Vec<u8>>,
+}
+
+impl FrameReader {
+    pub fn new() -> FrameReader {
+        FrameReader::default()
+    }
+
+    /// The next frame. Cancel safe: `AsyncReadExt::read` reads nothing when it is cancelled.
+    pub async fn next<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> Result<Zeroizing<Vec<u8>>, FrameError> {
+        let mut chunk = Zeroizing::new([0u8; 4096]);
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+                if len == 0 || len > MAX_FRAME {
+                    return Err(FrameError::BadLength(len));
+                }
+                if self.buf.len() >= 4 + len {
+                    let body = Zeroizing::new(self.buf[4..4 + len].to_vec());
+                    let rest = Zeroizing::new(self.buf[4 + len..].to_vec());
+                    // (a drain would leave the frame's bytes in the vector's spare room: all of it is zeroed)
+                    self.buf.zeroize();
+                    self.buf.extend_from_slice(&rest);
+                    return Ok(body);
+                }
+            }
+            match r.read(&mut chunk[..]).await {
+                Ok(0) => {
+                    return Err(if self.buf.is_empty() {
+                        FrameError::Closed
+                    } else {
+                        FrameError::Truncated
+                    });
+                }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) => return Err(FrameError::Io(e.kind())),
+            }
+        }
+    }
+}
+
 /// Writes one frame and flushes it.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std::io::Result<()> {
     if body.is_empty() || body.len() > MAX_FRAME {
@@ -83,6 +129,25 @@ mod tests {
         let zero = 0u32.to_le_bytes();
         let mut r = &zero[..];
         assert_eq!(read_frame(&mut r).await, Err(FrameError::BadLength(0)));
+    }
+
+    // (paused time: the timeout fires as soon as nothing else can run, without a real wait)
+    #[tokio::test(start_paused = true)]
+    async fn the_frame_reader_reads_frames_that_come_in_pieces() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, br#"{"id":1}"#).await.unwrap();
+        write_frame(&mut bytes, br#"{"id":22}"#).await.unwrap();
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let mut reader = FrameReader::new();
+        // half of the first frame, then a read that is dropped before anything comes: nothing is lost
+        tx.write_all(&bytes[..6]).await.unwrap();
+        let cut = tokio::time::timeout(std::time::Duration::from_millis(10), reader.next(&mut rx)).await;
+        assert!(cut.is_err(), "the frame is not complete yet");
+        tx.write_all(&bytes[6..]).await.unwrap();
+        assert_eq!(&reader.next(&mut rx).await.unwrap()[..], br#"{"id":1}"#);
+        assert_eq!(&reader.next(&mut rx).await.unwrap()[..], br#"{"id":22}"#);
+        drop(tx);
+        assert_eq!(reader.next(&mut rx).await, Err(FrameError::Closed));
     }
 
     #[tokio::test]

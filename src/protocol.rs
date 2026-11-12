@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
-/// One request of the browser. `id` is a number that the answer repeats; 0 is not a valid id.
+/// One request of the browser. `id` is a number that the answer repeats; 0 is not a valid id (it marks events).
 #[derive(Deserialize)]
 pub struct Request {
     pub id: u64,
@@ -16,7 +16,7 @@ pub struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    /// The first request. Says where the state is and which server to use.
+    /// The first request. Says where the state is, which server to use, and the idle deadline.
     Hello {
         protocol: u32,
         /// The directory of the helper's state ("" with `persist` false: nothing is written).
@@ -29,22 +29,47 @@ pub enum Op {
         client_version: String,
         #[serde(default)]
         persist: bool,
+        /// Seconds without a request after which the helper locks itself (exits). 0: never.
+        #[serde(default)]
+        idle_seconds: u64,
     },
-    /// Log in with the master password. When the account asks for a second factor, the second `login` carries the
-    /// same email and the code only: the helper kept the password of the first one.
+    /// Log in with the master password. A second step carries the same email, the code and its provider; the helper
+    /// kept the password of the first step. `resend` asks for the code again (a new mail).
     Login {
         email: String,
         #[serde(default)]
         password: Option<Secret>,
         #[serde(default)]
-        totp: Option<Secret>,
+        code: Option<Secret>,
+        /// "authenticator", "email" or "device".
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        resend: bool,
     },
-    /// Unlock the remembered account with the master password.
-    Unlock { password: Secret },
+    /// Log in with the account's personal API key, then unlock with the master password.
+    LoginApiKey {
+        client_id: String,
+        client_secret: Secret,
+        password: Secret,
+    },
+    /// Unlock the remembered account with the master password or the PIN.
+    Unlock {
+        #[serde(default)]
+        password: Option<Secret>,
+        #[serde(default)]
+        pin: Option<Secret>,
+    },
     /// Lock: the helper answers, then exits.
     Lock,
+    /// Forget the account here (state, tokens, PIN): the helper answers, then exits.
+    Logout,
     /// Get the vault from the server again.
     Sync,
+    /// Set the PIN that unlocks this account on this machine.
+    PinSet { pin: Secret },
+    /// Remove the PIN.
+    PinClear,
     /// The logins that match a page.
     LoginsFor {
         /// The address of the document that holds the form.
@@ -57,11 +82,11 @@ pub enum Op {
     },
     /// The values of one login, for a fill that the user asked for.
     Fill { item: String, fields: Vec<String> },
-    /// The user is active. No answer.
+    /// The user is active: the idle deadline starts again. No answer.
     Keepalive,
 }
 
-/// A value that is zeroed when it is dropped: a password or a one-time code.
+/// A value that is zeroed when it is dropped: a password, a PIN, a code, a client secret.
 #[derive(Deserialize, Default)]
 #[serde(transparent)]
 pub struct Secret(pub String);
@@ -92,6 +117,11 @@ pub fn ok(id: u64, body: Value) -> Value {
         }
     }
     out
+}
+
+/// An event: a message that answers no request (id 0).
+pub fn event(name: &str) -> Value {
+    json!({ "id": 0, "ok": true, "event": name })
 }
 
 /// One row of `logins_for`: what the browser shows. No password.
@@ -125,10 +155,16 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"id":3,"op":"login","email":"a@b.c","password":"pw"}"#).unwrap();
         assert_eq!(r.id, 3);
         match r.op {
-            Op::Login { email, password, totp } => {
+            Op::Login {
+                email,
+                password,
+                code,
+                provider,
+                resend,
+            } => {
                 assert_eq!(email, "a@b.c");
                 assert_eq!(password.map(|p| p.0.clone()).as_deref(), Some("pw"));
-                assert!(totp.is_none());
+                assert!(code.is_none() && provider.is_none() && !resend);
             }
             _ => panic!("not a login"),
         }
@@ -138,6 +174,25 @@ mod tests {
             serde_json::from_str(r#"{"id":5,"op":"logins_for","url":"https://a.b/","host":"a.b","domain":"a.b"}"#)
                 .unwrap();
         assert!(matches!(r.op, Op::LoginsFor { .. }));
+        let r: Request = serde_json::from_str(
+            r#"{"id":6,"op":"login_api_key","client_id":"user.x","client_secret":"s","password":"p"}"#,
+        )
+        .unwrap();
+        assert!(matches!(r.op, Op::LoginApiKey { .. }));
+        let r: Request = serde_json::from_str(r#"{"id":7,"op":"unlock","pin":"1234"}"#).unwrap();
+        assert!(matches!(
+            r.op,
+            Op::Unlock {
+                password: None,
+                pin: Some(_)
+            }
+        ));
+        let r: Request = serde_json::from_str(r#"{"id":8,"op":"pin_set","pin":"1234"}"#).unwrap();
+        assert!(matches!(r.op, Op::PinSet { .. }));
+        for op in ["pin_clear", "logout", "keepalive", "sync"] {
+            let text = format!(r#"{{"id":9,"op":"{op}"}}"#);
+            assert!(serde_json::from_str::<Request>(&text).is_ok(), "{op}");
+        }
     }
 
     #[test]
@@ -154,5 +209,8 @@ mod tests {
         let e = error(8, "bad_password", "The master password is wrong.");
         assert_eq!(e["ok"], false);
         assert_eq!(e["error"], "bad_password");
+        let ev = event("locked");
+        assert_eq!(ev["id"], 0);
+        assert_eq!(ev["event"], "locked");
     }
 }

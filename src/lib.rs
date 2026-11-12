@@ -8,20 +8,24 @@
 //! - `protocol`: the requests and the answers, as JSON.
 //! - `matching`: which saved URIs match a page.
 //! - `state`: the encrypted account state on disk.
+//! - `tokens`: the secrets that open the server (refresh token, API key secret), in the system store.
+//! - `identity`: the token request of the identity server, as a form and its answer (no SDK type).
 //! - `sdk`: every call to the Bitwarden SDK. No other module names an SDK type.
-//! - `server`: the loop that reads requests and writes answers.
+//! - `server`: the loop that reads requests and writes answers, and the idle deadline.
 //! - `harden`: process protections (no core dump, no debugger attach).
 
 pub mod frame;
 pub mod harden;
+pub mod identity;
 pub mod matching;
 pub mod protocol;
 pub mod sdk;
 pub mod server;
 pub mod state;
+pub mod tokens;
 
 /// The version of the pipe protocol. A browser that sends another version gets an error from `hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The version of this helper, as `hello` reports it.
 pub const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");

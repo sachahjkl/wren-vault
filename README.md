@@ -35,9 +35,14 @@ The program is `target/release/wren-vault` (`.exe` on Windows). In the Wren repo
 this directory (`../wren-vault` by default) and copies the program to `build/vault/`. If `Cargo.lock` does not exist
 yet, `wrentool build vault` makes it once; commit it.
 
+On Linux the build links libdbus (the Secret Service store of the tokens): `pkg-config` and the `dbus` development
+files must be present (the Nix flake provides them).
+
 ## Protocol
 
-Version 1.
+Version 2 (this helper 0.2.0). Changes from version 1: `login` carries `code` and `provider` instead of `totp`, and
+answers `need_device_code`; new requests `login_api_key`, `logout`, `pin_set`, `pin_clear`; `unlock` takes `pin`;
+`hello` takes `idle_seconds` and answers `login` and `pin`; the event `locked`.
 
 ### Frames
 
@@ -48,7 +53,7 @@ Wren writes requests on the helper's standard input. The helper writes answers o
 request, in the order of the requests. `keepalive` has no answer. The helper writes nothing else on standard output.
 It writes no value of the vault on standard error.
 
-The helper exits when its standard input closes, and after it answers `lock`.
+The helper exits when its standard input closes, after it answers `lock` or `logout`, and at its idle deadline.
 
 ### Requests and answers
 
@@ -57,45 +62,73 @@ A request is `{"id": <integer from 1>, "op": "<name>", ...fields}`. An answer re
 - success: `{"id": n, "ok": true, ...fields}`
 - failure: `{"id": n, "ok": false, "error": "<code>", "message": "<sentence>"}`
 
+An event answers no request: `{"id": 0, "ok": true, "event": "<name>"}`. The only event is `locked` (see "Idle
+deadline").
+
 An unknown `op` or a malformed request gets the error `bad_request` (with id 0 when the id cannot be read). Every
 request but `hello` needs a `hello` before it (`no_hello`).
 
 | op | Request fields | Answer fields |
 |---|---|---|
-| `hello` | `protocol` (1), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email` |
-| `login` | `email` and `password`; or, for the second step, `email` and `totp` (the code of the authenticator app) | `result`: `"ok"` (unlocked), or `"need_two_factor"` with `providers` (`["authenticator"]`) |
-| `unlock` | `password` | none |
+| `hello` | `protocol` (2), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool) |
+| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true) | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
+| `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email` |
+| `unlock` | `password` or `pin` | none; a `bad_pin` error carries `tries_left` |
 | `lock` | none | none; the helper then exits |
+| `logout` | none | none; the helper forgets the account (state, tokens, PIN), then exits |
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
+| `pin_set` | `pin` (4 characters or more) | none |
+| `pin_clear` | none | none |
 | `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp}` |
 | `fill` | `item` (a row id), `fields` (a list of `"username"`, `"password"`) | `username`, `password` (only the asked fields that the item has) |
-| `keepalive` | none | no answer |
+| `keepalive` | none | no answer; the idle deadline starts again |
 
-A login with a second factor is two requests. The first `login` (email and password) answers `need_two_factor`, and
-the helper keeps that email and password. The browser asks the person for the code and sends `login` again with the
-same email and `totp` only: the master password crosses the pipe once. A failed second step forgets the kept password;
-a new `login` with a password replaces it. (A `login` may also carry `password` and `totp` together.)
+### Login steps
+
+- `provider` is `"authenticator"` (the code of an authenticator app; the default), `"email"` (a code by email) or
+  `"device"` (the code of the server's new-device mail). `providers` lists the second steps of the account that the
+  helper supports (`"authenticator"`, `"email"`). An account with none of them (Duo, a security key, YubiKey OTP only)
+  gets `unsupported_two_factor`: its API key logs in instead.
+- A login with a second step is two requests or more. The first `login` (email and password) answers
+  `need_two_factor` or `need_device_code`, and the helper keeps the email, the password and the device identifier of
+  that login. The browser asks the person for the code and sends `login` again with the same email, `code` and
+  `provider`: the master password crosses the pipe once. A failed second step forgets the kept password; a new
+  `login` with a password replaces it. (A `login` may also carry `password`, `code` and `provider` together.)
+- `resend` asks for a code again. With `provider` `"email"`, the helper asks the server to mail the two-step code and
+  answers `need_two_factor` with `email_sent` true. With `"device"`, it sends the first step again, and the server
+  mails a new code. `email_sent` is also true when the email code is the account's only second step: the server mailed
+  it with its answer.
+
+### Idle deadline
+
+`hello`'s `idle_seconds` (0: none) is the helper's own guard. When no request (`keepalive` included) comes for that
+long, the helper writes the event `locked` and exits: lock is the exit of the process. The browser locks first, on
+its own timer, and sends `keepalive` while the person is active.
 
 ### Errors
 
 | Code | Meaning |
 |---|---|
-| `bad_request` | The frame is not a request of this protocol. |
+| `bad_request` | The frame is not a request of this protocol, or a field is missing (a code without a waiting login, an unlock without a password or a PIN, a PIN shorter than 4). |
 | `bad_protocol` | `hello` asked for another protocol version. |
 | `no_hello` | A request came before `hello`. |
 | `bad_server` | A server URL is not `https` (or `http` to `127.0.0.1`, `[::1]`, `localhost`). |
-| `bad_credentials` | The server refused the email, the password or the code. The message is the server's. |
-| `unsupported_two_factor` | The account asks for a second factor other than an authenticator app. |
-| `unsupported_account` | The account does not unlock with a master password (SSO, key connector). |
+| `bad_credentials` | The server refused the email, the password, the code or the API key. The message is the server's. |
+| `unsupported_two_factor` | The account's second steps are none that the helper supports. |
+| `unsupported_account` | The account does not unlock with a master password (SSO, key connector), or its key settings are not supported. |
 | `network` | The server cannot be reached or refused the request. |
-| `login_failed` | Another login failure. |
-| `no_account` | `unlock` without a remembered account. |
-| `bad_password` | `unlock` with a wrong master password. |
+| `login_failed` | Another login failure, or an answer of the server that the helper does not understand. |
+| `no_account` | `unlock` or a PIN request without a remembered account. |
+| `bad_password` | `unlock` with a wrong master password, or a master password that does not open the account's keys. |
+| `bad_pin` | `unlock` with a wrong PIN. `tries_left` says how many wrong PINs remain. |
+| `pin_reset` | The fifth wrong PIN in a row: the PIN was removed. Only the master password unlocks now. |
+| `no_pin` | `unlock` with a PIN, and none is set. |
+| `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
 | `no_item` | `fill` names an item that is not a login of the vault. |
-| `decrypt` | The item cannot be decrypted. |
-| `state_write`, `state_format` | The state directory cannot be written, or the saved state cannot be read. |
+| `decrypt` | The item cannot be decrypted, or the PIN cannot be set. |
+| `state_write`, `state_format` | The state directory (or the token store) cannot be written, or the saved state cannot be read. |
 
 ### Matching
 
@@ -110,38 +143,80 @@ a new `login` with a password replaces it. (A `login` may also carry `password` 
 The helper has no Public Suffix List. The browser sends the registrable domain, and it checks every row again with its
 own list before it shows it.
 
+## Device
+
+The helper sends its own token request, `POST {identity}/connect/token` (`src/identity.rs`): the SDK's
+`login_password` at the pinned revision sends device type `ChromeBrowser`, one device identifier that every SDK user
+shares, and no field for the new-device code. The helper sends:
+
+| Field | Value |
+|---|---|
+| `client_id` | `web`: the client of browsers. The SDK renews the access token with the same client id. |
+| `deviceType` | 14, `UnknownBrowser`: a browser that the server does not know by name. The SDK's `Device-Type` header is the same. |
+| `deviceIdentifier` | A random UUID made at the first login of the account, kept in the state. |
+| `deviceName` | `device_name` of `hello` (`Wren`). |
+
+Everything else is the SDK's: the prelogin, the hash of the master password, the sync, the keys, the PIN, the items. A
+renewal with an API key goes through the SDK and names the SDK's fixed device; no new-device check applies to API
+keys.
+
 ## Security
 
 - The keys stay in this process. Lock is the exit of the process: the operating system frees every page.
-- The Bitwarden SDK installs a zeroizing global allocator: freed memory is cleared. Passwords received on the pipe are
-  also zeroed after use.
+- The Bitwarden SDK installs a zeroizing global allocator: freed memory is cleared. Passwords, PINs, codes and client
+  secrets received on the pipe are also zeroed after use.
 - Linux: no core dump (`RLIMIT_CORE` 0) and `PR_SET_DUMPABLE` 0 (no debugger attach from the same user). Windows: no
   error dialog or error-reporting prompt on a crash. A panic writes a fixed line on standard error.
 - The SDK's `tracing` output goes nowhere: the program installs no subscriber.
-- The helper connects only to the two configured URLs.
+- The helper connects only to the two configured URLs. TLS uses the system's certificate store: a self-hosted server
+  with a certificate of a private authority needs that authority in the system's store.
 
 ### State on disk
 
 `<state_dir>/state.json`, mode 0600, in a directory of mode 0700, written by a rename. With `persist` false nothing is
-written: the account is forgotten when the helper exits.
+written: the account is forgotten when the helper exits. Version 2 of the file; a file of another version is not read
+(the account logs in again).
 
 | Field | Content |
 |---|---|
-| `email`, `identity_url`, `api_url`, `device_id` | Public. |
+| `email`, `identity_url`, `api_url`, `device_id`, `user_id` | Public. |
+| `login`, `api_client_id` | How the account logged in (`password` or `api_key`), and the API key's client id. |
 | `master_password_unlock` | KDF parameters, salt, and the user key wrapped by the master key. |
 | `account_crypto` | The account's private keys, wrapped by the user key. |
 | `org_keys` | Organization keys, encrypted for the account. |
 | `ciphers` | The items as the server sends them, encrypted. |
-| `tokens`, `login_method` | The access and refresh tokens, and the login method that the SDK renews them with. |
+| `pin_envelope`, `pin_failures` | The user key sealed by the PIN (the SDK's PIN envelope), and the wrong PINs since the last good one. |
 | `last_sync` | Time of the last sync. |
 
-Nothing in the file opens the vault without the master password. A stolen refresh token gives access to the encrypted
-items on the server.
+Nothing in the file opens the vault without the master password or the PIN.
+
+### Tokens
+
+The secrets that open the account on the server stay out of `state.json` (`src/tokens.rs`): the refresh token, and the
+API key's client secret.
+
+- They go to the system store when one answers: the Secret Service on Linux (GNOME Keyring, KWallet; service
+  `wren-vault`, account the device identifier), the Credential Manager on Windows (DPAPI, bound to the user's
+  account).
+- If none answers, they go to `<state_dir>/tokens.json`, mode 0600: the level of a browser without a keyring. A later
+  write that the system store takes deletes the file.
+- The access token is never stored: the SDK renews it at the first request after an unlock.
+- `logout` deletes both.
+
+A stolen refresh token gives access to the encrypted items on the server, not to their content.
+
+### PIN
+
+`pin_set` seals the user key with the PIN (the SDK's PIN envelope, a password-based key derivation) and keeps the
+envelope in the state. A PIN is weaker than the master password: the helper counts wrong PINs in the state, and the
+fifth one in a row deletes the envelope (`pin_reset`). A new login starts without a PIN.
 
 ## Tests
 
-- `cargo test`: the frame codec, the protocol, the matching rules, the state file, and the login against a wiremock
-  server on loopback (wrong password, second factor, no server). No test contacts a real server.
+- `cargo test`: the frame codec, the protocol, the idle deadline (on tokio's paused clock), the matching rules, the
+  state file, the token store and its file fallback (with a fake system store), the PIN try counter, the form of the
+  token request, and the login against a wiremock server on loopback (wrong password, the authenticator and email
+  second steps, the new-device code, the API key, no server). No test contacts a real server.
 - A successful login needs fixtures made once from a test account (prelogin, token and sync answers). They are not in
   the repository yet.
 - Manual check before a release that changes the SDK revision: log in with a real account (US and EU), sync, fill.

@@ -41,6 +41,9 @@
         lockFile = ./Cargo.lock;
         allowBuiltinFetchGit = true;
       };
+      # the Secret Service store of the tokens links libdbus (found with pkg-config)
+      nativeBuildInputs = [pkgs.pkg-config];
+      buildInputs = [pkgs.dbus];
       meta = {
         description = "The Vault helper of the Wren browser";
         license = pkgs.lib.licenses.gpl3Only;
@@ -80,7 +83,7 @@
     formatter.${system} = pkgs.alejandra;
 
     devShells.${system}.default = pkgs.mkShell {
-      packages = [rust.default] ++ preCommit.enabledPackages;
+      packages = [rust.default pkgs.pkg-config pkgs.dbus] ++ preCommit.enabledPackages;
       inherit (preCommit) shellHook;
     };
   };
