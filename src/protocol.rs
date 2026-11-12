@@ -173,6 +173,21 @@ pub enum Op {
         #[serde(default)]
         include_number: bool,
     },
+    /// The vault's passkeys of a site, for a page's `navigator.credentials.get`: `allow` lists the credential ids that
+    /// the page accepts (base64url; empty: any passkey of `rp_id`).
+    PasskeysFor {
+        rp_id: String,
+        #[serde(default)]
+        allow: Vec<String>,
+    },
+    /// Sign a page's assertion with one passkey of the vault (`item` and `credential_id`, from a `passkeys_for` row).
+    /// `client_data_hash`: the SHA-256 of the clientDataJSON that the browser made, base64url.
+    PasskeyAssert {
+        item: String,
+        credential_id: String,
+        rp_id: String,
+        client_data_hash: String,
+    },
     /// The user is active: the idle deadline starts again. No answer.
     Keepalive,
 }
@@ -383,6 +398,26 @@ mod tests {
         assert!(
             serde_json::from_str::<Request>(r#"{"id":25,"op":"generate","kind":"password","length":-1}"#).is_err(),
             "a negative length is no request"
+        );
+    }
+
+    #[test]
+    fn passkey_requests_parse_with_their_defaults() {
+        let r: Request = serde_json::from_str(r#"{"id":30,"op":"passkeys_for","rp_id":"a.example"}"#).unwrap();
+        assert!(matches!(&r.op, Op::PasskeysFor { rp_id, allow } if rp_id == "a.example" && allow.is_empty()));
+        let r: Request =
+            serde_json::from_str(r#"{"id":31,"op":"passkeys_for","rp_id":"a.example","allow":["aWQ","aWQy"]}"#)
+                .unwrap();
+        assert!(matches!(&r.op, Op::PasskeysFor { allow, .. } if allow.len() == 2));
+        let r: Request = serde_json::from_str(
+            r#"{"id":32,"op":"passkey_assert","item":"x","credential_id":"aWQ","rp_id":"a.example","client_data_hash":"aGFzaA"}"#,
+        )
+        .unwrap();
+        assert!(matches!(&r.op, Op::PasskeyAssert { item, credential_id, .. } if item == "x" && credential_id == "aWQ"));
+        assert!(
+            serde_json::from_str::<Request>(r#"{"id":33,"op":"passkey_assert","item":"x","rp_id":"a.example"}"#)
+                .is_err(),
+            "an assertion needs its credential and the client data's hash"
         );
     }
 

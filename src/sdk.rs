@@ -32,15 +32,19 @@ use bitwarden_crypto::{
     derive_symmetric_key_from_prf, safe::PasswordProtectedKeyEnvelope,
 };
 use bitwarden_crypto_sync_handler::CryptoSyncData;
+use bitwarden_fido::{
+    CheckUserOptions, CheckUserResult, Fido2Authenticator, Fido2CallbackError, Fido2CredentialStore,
+    Fido2UserInterface, GetAssertionRequest, Options as AssertionOptions, UiHint, Verification, string_to_guid_bytes,
+};
 use bitwarden_generators::{
     GeneratorClientsExt, MAXIMUM_MIN_CHAR_COUNT, MAXIMUM_PASSPHRASE_NUM_WORDS, MAXIMUM_PASSWORD_LENGTH,
     MINIMUM_PASSPHRASE_NUM_WORDS, MINIMUM_PASSWORD_LENGTH, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
 use bitwarden_sync::{SyncClientExt, SyncHandler, SyncHandlerError, SyncRequest};
 use bitwarden_vault::{
-    CardView, Cipher, CipherCreateRequest, CipherEditRequest, CipherId, CipherRepromptType, CipherType, CipherView,
-    CipherViewType, CreateCipherError, EditCipherError, IdentityView, LoginUriView, LoginView, UriMatchType,
-    VaultClientExt, generate_totp,
+    CardView, Cipher, CipherCreateRequest, CipherEditRequest, CipherId, CipherListView, CipherRepromptType, CipherType,
+    CipherView, CipherViewType, CreateCipherError, EditCipherError, EncryptionContext, Fido2CredentialNewView,
+    Fido2CredentialView, IdentityView, LoginUriView, LoginView, UriMatchType, VaultClientExt, generate_totp,
 };
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
@@ -344,6 +348,26 @@ pub struct Code {
 /// pages through a long list as it scrolls (a page of 500 short rows stays far under a frame's bound).
 pub const SEARCH_PAGE: usize = 100;
 pub const SEARCH_PAGE_MAX: usize = 500;
+
+/// One passkey of the vault for a site (`passkeys_for`): its item, what the browser shows, its ids (base64url).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyRow {
+    pub item: String,
+    pub name: String,
+    /// The passkey's user name, else its display name, else the login's username, else the item's name.
+    pub username: String,
+    pub credential_id: String,
+    pub user_handle: String,
+}
+
+/// A page's assertion, signed by the SDK's authenticator with a passkey of the vault (each value base64url).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAssertion {
+    pub authenticator_data: String,
+    pub signature: String,
+    pub user_handle: String,
+    pub credential_id: String,
+}
 
 /// A password login that waits for its second step: what the next `login` needs.
 struct Waiting {
@@ -1647,10 +1671,6 @@ impl Session {
         if view.deleted_date.is_some() || !matches!(view.r#type, CipherType::Login) || view.login.is_none() {
             return Err(no_login());
         }
-        // the SDK's edit reads the item from the client's own store (its password history is kept against that copy);
-        // the helper keeps the items itself, so it puts this one there first
-        let repository = client.platform().state().get::<Cipher>().map_err(|_| not_saved())?;
-        repository.set(id, cipher).await.map_err(|_| not_saved())?;
         let mut request = CipherEditRequest::try_from(view).map_err(|_| not_saved())?;
         if let CipherViewType::Login(login) = &mut request.r#type {
             if !req.username.is_empty() {
@@ -1674,10 +1694,7 @@ impl Session {
                 }
             }
         }
-        client.vault().ciphers().edit(request).await.map_err(|e| match e {
-            EditCipherError::Api(a) => api_failure(&a),
-            _ => not_saved(),
-        })?;
+        send_edit(client, id, cipher, request).await?;
         Ok(id)
     }
 
@@ -1703,6 +1720,277 @@ impl Session {
         let view = self.login_view(item).await?;
         totp_now(view.login.as_ref().and_then(|l| l.totp.as_deref()))
     }
+
+    /// `passkeys_for`: the vault's passkeys of the relying party `rp_id` that the SDK's authenticator discovers (a
+    /// passkey without a user handle cannot answer a page: the SDK leaves it out), in the page's `allow` list when it
+    /// gives one (credential ids, base64url). Sorted by item name.
+    pub async fn passkeys_for(&self, rp_id: &str, allow: &[String]) -> Result<Vec<PasskeyRow>, Failure> {
+        let client = self.client.as_ref().ok_or_else(locked)?;
+        let rp_id = rp_id.trim();
+        if rp_id.is_empty() {
+            return Err(Failure::new("bad_request", "A passkey request needs its relying party."));
+        }
+        // (an allow list of ids that do not decode lets no passkey through: the page named other credentials)
+        let restricted = !allow.is_empty();
+        let allow: Vec<Vec<u8>> = allow.iter().filter_map(|a| identity::base64url_decode(a)).collect();
+        let views: Vec<CipherView> = self
+            .views()
+            .await?
+            .into_iter()
+            .filter(|v| matches!(v.r#type, CipherType::Login) && !v.get_fido2_credentials().is_empty())
+            .collect();
+        let store = PasskeyStore { views };
+        let picker = Picker { credential_id: None };
+        let mut authenticator = Fido2Authenticator::new(client, &picker, &store);
+        let found = authenticator
+            .silently_discover_credentials(rp_id.to_string(), None)
+            .await
+            .map_err(|_| Failure::new("decrypt", "The vault's passkeys cannot be read."))?;
+        let mut rows = Vec::new();
+        for f in found {
+            if !f.rp_id.eq_ignore_ascii_case(rp_id) || (restricted && !allow.contains(&f.credential_id)) {
+                continue;
+            }
+            let item = f.cipher_id.to_string();
+            let name = store
+                .views
+                .iter()
+                .find(|v| v.id.map(|i| i.to_string()).as_deref() == Some(item.as_str()))
+                .map(|v| v.name.clone())
+                .unwrap_or_default();
+            rows.push(PasskeyRow {
+                item,
+                name,
+                username: f.user_name_for_ui.unwrap_or_default(),
+                credential_id: identity::base64url(&f.credential_id),
+                user_handle: identity::base64url(&f.user_handle),
+            });
+        }
+        rows.sort_by(|a, b| {
+            (a.name.to_lowercase(), a.username.to_lowercase()).cmp(&(b.name.to_lowercase(), b.username.to_lowercase()))
+        });
+        Ok(rows)
+    }
+
+    /// `passkey_assert`: the SDK's authenticator signs a page's assertion with the passkey `credential_id` of `item`
+    /// (authenticator data with the hash of `rp_id`, the flags UP and UV (an unlocked vault is a verified user), the
+    /// sign count; the signature over the authenticator data and `client_data_hash`). A passkey with a sign counter
+    /// gets its new count saved on the server, as `save` does.
+    pub async fn passkey_assert(
+        &mut self,
+        item: &str,
+        credential_id: &str,
+        rp_id: &str,
+        client_data_hash: &str,
+    ) -> Result<SignedAssertion, Failure> {
+        let client = self.client.clone().ok_or_else(locked)?;
+        let gone = || Failure::new("no_item", "The passkey is not in the vault any more.");
+        let hash = identity::base64url_decode(client_data_hash)
+            .filter(|h| h.len() == 32)
+            .ok_or_else(|| Failure::new("bad_request", "The client data's hash is a SHA-256, in base64url."))?;
+        let wanted = identity::base64url_decode(credential_id).ok_or_else(gone)?;
+        let rp_id = rp_id.trim();
+        let cipher = self.ciphers.iter().find(|c| id_is(c, item)).cloned().ok_or_else(gone)?;
+        let view = client
+            .vault()
+            .ciphers()
+            .decrypt(cipher.clone())
+            .await
+            .map_err(|_| Failure::new("decrypt", "The item cannot be decrypted."))?;
+        if view.deleted_date.is_some() || !matches!(view.r#type, CipherType::Login) {
+            return Err(gone());
+        }
+        let credential = view
+            .get_fido2_credentials()
+            .into_iter()
+            .find(|c| passkey_matches(c, rp_id, Some(std::slice::from_ref(&wanted))))
+            .ok_or_else(gone)?;
+        // the SDK's authenticator signs with the first passkey of the item that the picker returns: the item goes to it
+        // with that one passkey only
+        let mut picked = view.clone();
+        if let Some(login) = picked.login.as_mut() {
+            login.fido2_credentials = Some(vec![credential.clone()]);
+        }
+        let store = PasskeyStore { views: vec![picked] };
+        let picker = Picker {
+            credential_id: Some(wanted),
+        };
+        let request = GetAssertionRequest {
+            rp_id: rp_id.to_string(),
+            client_data_hash: hash,
+            allow_list: None,
+            // (no resident-key option on an assertion; user verification required: the unlocked vault verified the user)
+            options: AssertionOptions::from(CheckUserOptions {
+                require_presence: false,
+                require_verification: Verification::Required,
+            }),
+            extensions: None,
+        };
+        let result = {
+            let mut authenticator = Fido2Authenticator::new(&client, &picker, &store);
+            authenticator.get_assertion(request).await
+        }
+        .map_err(|_| Failure::new("assert_failed", "The passkey could not sign the page's request."))?;
+        let signed = SignedAssertion {
+            authenticator_data: identity::base64url(&result.authenticator_data),
+            signature: identity::base64url(&result.signature),
+            user_handle: identity::base64url(&result.user_handle),
+            credential_id: identity::base64url(&result.credential_id),
+        };
+        if let Some(count) = sign_count(&result.authenticator_data)
+            && count > credential.counter.trim().parse::<u32>().unwrap_or(0)
+        {
+            // (the page has its assertion: a count the server did not take fails no login, and the next sync shows the
+            // server's count again)
+            let _ = self
+                .save_sign_count(&client, cipher, view, &credential.credential_id, count)
+                .await;
+        }
+        Ok(signed)
+    }
+
+    /// Saves a passkey's new sign count in its item, through the SDK's edit (as `save`), on the whole item: the SDK
+    /// authenticator's own update holds only the picked passkey and would drop the item's others.
+    async fn save_sign_count(
+        &mut self,
+        client: &Client,
+        cipher: Cipher,
+        mut view: CipherView,
+        credential_id: &str,
+        count: u32,
+    ) -> Result<(), Failure> {
+        let id = cipher.id.ok_or_else(not_saved)?;
+        if let Some(credentials) = view.login.as_mut().and_then(|l| l.fido2_credentials.as_mut()) {
+            for c in credentials.iter_mut().filter(|c| c.credential_id == credential_id) {
+                c.counter = count.to_string();
+            }
+        }
+        let request = CipherEditRequest::try_from(view).map_err(|_| not_saved())?;
+        send_edit(client, id, cipher, request).await?;
+        let stored = stored_cipher(client, id).await?;
+        self.keep_cipher(&id.to_string(), stored);
+        Ok(())
+    }
+}
+
+/// Whether a passkey belongs to the relying party `rp_id` (ASCII case aside) and, with `ids`, is one of them (raw
+/// credential ids).
+fn passkey_matches(c: &Fido2CredentialView, rp_id: &str, ids: Option<&[Vec<u8>]>) -> bool {
+    if !c.rp_id.eq_ignore_ascii_case(rp_id) {
+        return false;
+    }
+    match ids {
+        None => true,
+        Some(ids) => string_to_guid_bytes(&c.credential_id).is_ok_and(|raw| ids.contains(&raw)),
+    }
+}
+
+/// The sign count of authenticator data: 4 bytes, big-endian, after the rp id hash (32) and the flags (1).
+fn sign_count(authenticator_data: &[u8]) -> Option<u32> {
+    let b = authenticator_data.get(33..37)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The SDK authenticator's view of the vault: the decrypted logins that hold a passkey (for an assertion, the picked
+/// item with the picked passkey only).
+struct PasskeyStore {
+    views: Vec<CipherView>,
+}
+
+#[async_trait::async_trait]
+impl Fido2CredentialStore for PasskeyStore {
+    async fn find_credentials(
+        &self,
+        ids: Option<Vec<Vec<u8>>>,
+        rp_id: String,
+        user_handle: Option<Vec<u8>>,
+    ) -> Result<Vec<CipherView>, Fido2CallbackError> {
+        Ok(self
+            .views
+            .iter()
+            .filter(|v| {
+                v.get_fido2_credentials().iter().any(|c| {
+                    passkey_matches(c, &rp_id, ids.as_deref())
+                        && user_handle.as_ref().is_none_or(|h| {
+                            c.user_handle.as_deref().and_then(identity::base64url_decode).as_ref() == Some(h)
+                        })
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn all_credentials(&self) -> Result<Vec<CipherListView>, Fido2CallbackError> {
+        Ok(Vec::new())
+    }
+
+    // The authenticator's update of a sign count comes here encrypted, with the picked passkey only: the helper saves
+    // the count itself on the whole item (`Session::save_sign_count`).
+    async fn save_credential(&self, _cred: EncryptionContext) -> Result<(), Fido2CallbackError> {
+        Ok(())
+    }
+}
+
+/// The SDK authenticator's user interface: the browser asked the person already, so it picks the passkey that the
+/// request names, and the user is present and verified (the vault is unlocked). It never creates a passkey.
+struct Picker {
+    /// The raw credential id to sign with (`None`: a discovery, nothing to pick).
+    credential_id: Option<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl Fido2UserInterface for Picker {
+    async fn check_user<'a>(
+        &self,
+        _options: CheckUserOptions,
+        _hint: UiHint<'a, CipherView>,
+    ) -> Result<CheckUserResult, Fido2CallbackError> {
+        Ok(CheckUserResult {
+            user_present: true,
+            user_verified: true,
+        })
+    }
+
+    async fn pick_credential_for_authentication(
+        &self,
+        available_credentials: Vec<CipherView>,
+    ) -> Result<CipherView, Fido2CallbackError> {
+        let Some(wanted) = &self.credential_id else {
+            return Err(Fido2CallbackError::UserInterfaceRequired);
+        };
+        available_credentials
+            .into_iter()
+            .find(|v| {
+                v.get_fido2_credentials()
+                    .iter()
+                    .any(|c| string_to_guid_bytes(&c.credential_id).is_ok_and(|raw| &raw == wanted))
+            })
+            .ok_or(Fido2CallbackError::OperationCancelled)
+    }
+
+    async fn check_user_and_pick_credential_for_creation(
+        &self,
+        _options: CheckUserOptions,
+        _new_credential: Fido2CredentialNewView,
+    ) -> Result<(CipherView, CheckUserResult), Fido2CallbackError> {
+        Err(Fido2CallbackError::UserInterfaceRequired)
+    }
+
+    fn is_verification_enabled(&self) -> bool {
+        true
+    }
+}
+
+/// Sends an edit of an item through the SDK. The SDK's edit reads the item from the client's own store (it keeps the
+/// password history against that copy); the helper keeps the items itself, so it puts this one there first.
+async fn send_edit(client: &Client, id: CipherId, cipher: Cipher, request: CipherEditRequest) -> Result<(), Failure> {
+    let repository = client.platform().state().get::<Cipher>().map_err(|_| not_saved())?;
+    repository.set(id, cipher).await.map_err(|_| not_saved())?;
+    client.vault().ciphers().edit(request).await.map_err(|e| match e {
+        EditCipherError::Api(a) => api_failure(&a),
+        _ => not_saved(),
+    })?;
+    Ok(())
 }
 
 /// Whether the browser lists this item: a login, a card or an identity, not in the trash.
@@ -2723,6 +3011,238 @@ mod tests {
         assert_eq!(failure.code, "save_failed");
         assert!(failure.message.contains("maximum length"), "{}", failure.message);
         assert!(s.ciphers.is_empty());
+    }
+
+    // A P-256 private key in PKCS#8 DER (the one of bitwarden-fido's own tests): every test passkey signs with it.
+    const PASSKEY_KEY: &[u8] = &[
+        0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02, 0x01, 0x01, 0x04, 0x20, 0x06, 0x76,
+        0x5e, 0x85, 0xe0, 0x7f, 0xef, 0x43, 0xaa, 0x17, 0xe0, 0x7a, 0xd7, 0x85, 0x63, 0x01, 0x80, 0x70, 0x8c, 0x6c, 0x61,
+        0x43, 0x7d, 0xc3, 0xb1, 0xe6, 0xf9, 0x09, 0x24, 0xeb, 0x1f, 0xf5, 0xa1, 0x44, 0x03, 0x42, 0x00, 0x04, 0x35, 0x9a,
+        0x52, 0xf3, 0x82, 0x44, 0x66, 0x5f, 0x3f, 0xe2, 0xc4, 0x0b, 0x1c, 0x16, 0x34, 0xc5, 0x60, 0x07, 0x3a, 0x25, 0xfe,
+        0x7e, 0x7f, 0x7f, 0xda, 0xd4, 0x1c, 0x36, 0x90, 0x00, 0xee, 0xb1, 0x8e, 0x92, 0xb3, 0xac, 0x91, 0x7f, 0xb1, 0x8c,
+        0xa4, 0x85, 0xe7, 0x03, 0x07, 0xd1, 0xf5, 0x5b, 0xd3, 0x7b, 0xc3, 0x56, 0x11, 0xdf, 0xbc, 0x7a, 0x97, 0x70, 0x32,
+        0x4b, 0x3c, 0x84, 0x05, 0x71,
+    ];
+    // (`ITEM` is the id that `Echo` answers: the item whose passkey has a sign counter)
+    const BETA: &str = "6faa9684-c793-4a2d-8a12-b33900187097";
+    const GAMMA: &str = "7faa9684-c793-4a2d-8a12-b33900187097";
+    const ALICE: &str = "a36f3d35-5dae-4d07-8b24-f89e11082090";
+    const BOB: &str = "b36f3d35-5dae-4d07-8b24-f89e11082090";
+    const BOB_ELSEWHERE: &str = "c36f3d35-5dae-4d07-8b24-f89e11082090";
+    const CAROL: &str = "d36f3d35-5dae-4d07-8b24-f89e11082090";
+
+    fn passkey(id: &str, rp_id: &str, user: &str, counter: &str) -> Fido2CredentialView {
+        Fido2CredentialView {
+            credential_id: id.to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: identity::base64url(PASSKEY_KEY),
+            rp_id: rp_id.to_string(),
+            user_handle: Some(identity::base64url(user.as_bytes())),
+            user_name: Some(user.to_string()),
+            counter: counter.to_string(),
+            rp_name: None,
+            user_display_name: None,
+            discoverable: "true".to_string(),
+            creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+        }
+    }
+
+    fn passkey_login(id: &str, name: &str, passkeys: Vec<Fido2CredentialView>) -> CipherView {
+        CipherView {
+            partial: false,
+            id: Some(id.parse().unwrap()),
+            organization_id: None,
+            folder_id: None,
+            collection_ids: vec![],
+            key: None,
+            name: name.to_string(),
+            notes: None,
+            r#type: CipherType::Login,
+            login: Some(LoginView {
+                username: None,
+                password: None,
+                password_revision_date: None,
+                uris: None,
+                totp: None,
+                autofill_on_page_load: None,
+                http_authentication_enabled: None,
+                fido2_credentials: Some(passkeys),
+            }),
+            identity: None,
+            card: None,
+            secure_note: None,
+            ssh_key: None,
+            bank_account: None,
+            passport: None,
+            drivers_license: None,
+            favorite: false,
+            reprompt: CipherRepromptType::None,
+            organization_use_totp: false,
+            edit: true,
+            permissions: None,
+            view_password: true,
+            local_data: None,
+            attachments: None,
+            attachment_decryption_failures: None,
+            fields: None,
+            password_history: None,
+            creation_date: "2024-01-30T17:55:36.150Z".parse().unwrap(),
+            deleted_date: None,
+            revision_date: "2024-01-30T17:55:36.150Z".parse().unwrap(),
+            archived_date: None,
+        }
+    }
+
+    /// An unlocked session whose vault holds three logins with passkeys: "Alpha" (`ITEM`, a.example, with a sign
+    /// counter), "Beta" (a.example, and a second passkey of other.example), "Gamma" (b.example).
+    async fn with_passkeys(server: &wiremock::MockServer) -> Session {
+        let mut s = unlocked(server).await;
+        let views = [
+            passkey_login(ITEM, "Alpha", vec![passkey(ALICE, "a.example", "alice", "5")]),
+            passkey_login(
+                BETA,
+                "Beta",
+                vec![
+                    passkey(BOB, "a.example", "bob", "0"),
+                    passkey(BOB_ELSEWHERE, "other.example", "bob", "0"),
+                ],
+            ),
+            passkey_login(GAMMA, "Gamma", vec![passkey(CAROL, "b.example", "carol", "0")]),
+        ];
+        let client = s.client.clone().expect("unlocked");
+        for v in views {
+            let sealed = client.vault().ciphers().encrypt(v).await.ok().expect("the user key seals the item");
+            s.ciphers.push(sealed.cipher);
+        }
+        s
+    }
+
+    fn raw_id(id: &str) -> String {
+        identity::base64url(uuid::Uuid::parse_str(id).unwrap().as_bytes())
+    }
+
+    #[tokio::test]
+    async fn passkeys_for_filters_by_relying_party_and_allow_list() {
+        let server = wiremock::MockServer::start().await;
+        let s = with_passkeys(&server).await;
+        let rows = s.passkeys_for("a.example", &[]).await.unwrap_or_default();
+        let names: Vec<(&str, &str)> = rows.iter().map(|r| (r.name.as_str(), r.username.as_str())).collect();
+        assert_eq!(names, vec![("Alpha", "alice"), ("Beta", "bob")]);
+        assert_eq!(rows[0].item, ITEM);
+        assert_eq!(rows[0].credential_id, raw_id(ALICE));
+        assert_eq!(rows[0].user_handle, identity::base64url(b"alice"));
+        assert_eq!(
+            s.passkeys_for("A.Example", &[]).await.unwrap_or_default().len(),
+            2,
+            "a host's case does not count"
+        );
+        let rows = s.passkeys_for("a.example", &[raw_id(BOB)]).await.unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].item.as_str(), rows[0].credential_id.clone()), (BETA, raw_id(BOB)));
+        assert!(
+            s.passkeys_for("a.example", &[raw_id(CAROL)]).await.unwrap_or_default().is_empty(),
+            "a passkey of another site is not in the allow list's rows"
+        );
+        assert!(s.passkeys_for("a.example", &["!!".to_string()]).await.unwrap_or_default().is_empty());
+        let rows = s.passkeys_for("other.example", &[]).await.unwrap_or_default();
+        assert_eq!(rows.len(), 1, "the second passkey of an item is found too");
+        assert_eq!(rows[0].credential_id, raw_id(BOB_ELSEWHERE));
+        assert!(s.passkeys_for("c.example", &[]).await.unwrap_or_default().is_empty());
+        assert_eq!(s.passkeys_for("", &[]).await.err().map(|f| f.code), Some("bad_request"));
+        let locked = Session::default();
+        assert_eq!(locked.passkeys_for("a.example", &[]).await.err().map(|f| f.code), Some("locked"));
+    }
+
+    #[tokio::test]
+    async fn passkey_assert_signs_what_the_site_verifies() {
+        use p256::{
+            ecdsa::{Signature, SigningKey, signature::Verifier},
+            pkcs8::DecodePrivateKey,
+        };
+        use sha2::{Digest, Sha256};
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/ciphers/{ITEM}")))
+            .respond_with(Echo)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut s = with_passkeys(&server).await;
+        let key = SigningKey::from_pkcs8_der(PASSKEY_KEY).unwrap();
+        let client_data = br#"{"type":"webauthn.get","challenge":"Y2g","origin":"https://a.example"}"#;
+        let hash = Sha256::digest(client_data).to_vec();
+        let verify = |a: &SignedAssertion, rp_id: &str| -> (u8, u32) {
+            let data = identity::base64url_decode(&a.authenticator_data).unwrap();
+            assert!(data.len() >= 37);
+            assert_eq!(&data[..32], Sha256::digest(rp_id.as_bytes()).as_slice(), "the rp id hash");
+            let signature = Signature::from_der(&identity::base64url_decode(&a.signature).unwrap()).unwrap();
+            let mut signed = data.clone();
+            signed.extend_from_slice(&hash);
+            assert!(key.verifying_key().verify(&signed, &signature).is_ok(), "the signature verifies");
+            (data[32], sign_count(&data).unwrap())
+        };
+
+        // a passkey without a counter: nothing goes to the server
+        let a = s
+            .passkey_assert(BETA, &raw_id(BOB), "a.example", &identity::base64url(&hash))
+            .await
+            .unwrap_or_else(|f| panic!("{}: {}", f.code, f.message));
+        let (flags, count) = verify(&a, "a.example");
+        assert_eq!(flags & 0x01, 0x01, "user present");
+        assert_eq!(flags & 0x04, 0x04, "user verified");
+        assert_eq!(count, 0);
+        assert_eq!(a.credential_id, raw_id(BOB));
+        assert_eq!(a.user_handle, identity::base64url(b"bob"));
+        // the second passkey of the same item signs as itself
+        let a = s
+            .passkey_assert(BETA, &raw_id(BOB_ELSEWHERE), "other.example", &identity::base64url(&hash))
+            .await
+            .unwrap_or_else(|f| panic!("{}: {}", f.code, f.message));
+        verify(&a, "other.example");
+        assert_eq!(a.credential_id, raw_id(BOB_ELSEWHERE));
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // a passkey with a counter: the next count, saved on the server and in the helper's copy
+        let a = s
+            .passkey_assert(ITEM, &raw_id(ALICE), "a.example", &identity::base64url(&hash))
+            .await
+            .unwrap_or_else(|f| panic!("{}: {}", f.code, f.message));
+        let (_, count) = verify(&a, "a.example");
+        assert_eq!(count, 6);
+        let client = s.client.clone().unwrap();
+        let cipher = s.ciphers.iter().find(|c| id_is(c, ITEM)).cloned().unwrap();
+        let view = client.vault().ciphers().decrypt(cipher).await.ok().unwrap();
+        assert_eq!(view.get_fido2_credentials()[0].counter, "6");
+
+        let hashed = identity::base64url(&hash);
+        let refused = |r: Result<SignedAssertion, Failure>| r.err().map(|f| f.code);
+        assert_eq!(
+            refused(s.passkey_assert(ITEM, &raw_id(ALICE), "b.example", &hashed).await),
+            Some("no_item"),
+            "another site's request"
+        );
+        assert_eq!(
+            refused(s.passkey_assert(GAMMA, &raw_id(ALICE), "a.example", &hashed).await),
+            Some("no_item"),
+            "the passkey of another item"
+        );
+        let unknown = "8faa9684-c793-4a2d-8a12-b33900187097";
+        assert_eq!(
+            refused(s.passkey_assert(unknown, &raw_id(ALICE), "a.example", &hashed).await),
+            Some("no_item")
+        );
+        assert_eq!(
+            refused(s.passkey_assert(ITEM, &raw_id(ALICE), "a.example", "c2hvcnQ").await),
+            Some("bad_request"),
+            "a hash that is no SHA-256"
+        );
     }
 
     #[test]

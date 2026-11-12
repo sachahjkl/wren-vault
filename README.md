@@ -44,7 +44,8 @@ Version 5 (this helper 0.5.0). Changes from version 4: `hello` takes and answers
 (create or update a login, on the server and at once in the helper's copy of the vault) and `generate` (a password or a
 passphrase from the SDK's generator, also while locked); the rows of `search` list cards and identities too, and every
 row carries `kind`; `search` pages (`offset`, `limit` up to 500, `kinds`) and answers `total`; `fill` gives the fields
-of a card or an identity; the error `save_failed`.
+of a card or an identity; the error `save_failed`; new requests `passkeys_for` and `passkey_assert` (the vault's
+passkeys answer a page's `navigator.credentials.get`) and the error `assert_failed`.
 
 Version 4 (helper 0.4.0). Changes from version 3: new requests `password_hint`, `device_request`, `device_poll`,
 `passkey_options` and `login_passkey`; `login` takes `remember`; `unlock` takes `prf` and `credential_id`; `hello`
@@ -105,6 +106,8 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `device_poll` | none | `result`: `"pending"`, or `"ok"` (unlocked) with `email` |
 | `passkey_options` | `purpose` (`"login"` or `"unlock"`), `rp_id` (the web vault's domain) | `options` (the WebAuthn request's options, JSON text) |
 | `login_passkey` | `credential_id`, `authenticator_data`, `client_data_json`, `signature`, `user_handle` (each base64url), `prf` (the PRF output, base64url) | `result` (`"ok"`), `email` |
+| `passkeys_for` | `rp_id`, `allow` (credential ids, base64url; empty or absent: any passkey of `rp_id`) | `rows`: `{item, name, username, credential_id, user_handle}` (see "Passkeys of sites") |
+| `passkey_assert` | `item`, `credential_id`, `rp_id`, `client_data_hash` (base64url of the SHA-256 of the clientDataJSON) | `authenticator_data`, `signature`, `user_handle`, `credential_id` (each base64url) |
 | `keepalive` | none | no answer; the idle deadline starts again |
 
 ### Login steps
@@ -161,6 +164,22 @@ name of another kind of item gives nothing, without an error.
   sync.
 - The server refused it, or cannot be reached: `save_failed`, with the server's sentence when it gave one.
 
+### Passkeys of sites
+
+- `passkeys_for` lists the vault's passkeys (the passkeys of login items) whose relying party is `rp_id` (ASCII case
+  aside). With a non-empty `allow` (the credential ids of the page's `allowCredentials`, base64url), it lists only the
+  passkeys in it. A passkey without a user handle is not listed. `username` is the passkey's user name, else its
+  display name, else the login's username, else the item's name. `credential_id` and `user_handle` are base64url. The
+  rows are sorted by item name.
+- `passkey_assert` signs with the SDK's authenticator (`bitwarden-fido`). The authenticator data holds the SHA-256 of
+  `rp_id`, the flags UP and UV (an unlocked vault is a verified user) and the sign count. The signature (ES256, DER) is
+  over the authenticator data and `client_data_hash`. Wren makes the clientDataJSON and its hash: the helper sees
+  only the hash.
+- A passkey with a sign counter (not 0) gets its new count saved in its item, as `save` does (`PUT
+  {api}/ciphers/{id}`). A failed save does not fail the assertion.
+- Errors: `locked`; `bad_request` (an empty `rp_id`, a `client_data_hash` that is not 32 bytes); `no_item` (the item
+  or the passkey is not in the vault, or not of `rp_id`); `assert_failed` (the authenticator refused to sign).
+
 ### Generate
 
 The SDK's generator (`bitwarden-generators`) makes the value; no account and no server are needed, only `hello`.
@@ -203,9 +222,10 @@ its own timer, and sends `keepalive` while the person is active.
 | `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
-| `no_item` | `fill` names an item that is not a login, a card or an identity of the vault; `totp` or a `save` update names one that is not a login. |
+| `no_item` | `fill` names an item that is not a login, a card or an identity of the vault; `totp` or a `save` update names one that is not a login; `passkey_assert` names a passkey that is not in the vault for that relying party. |
 | `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
 | `save_failed` | `save`: the server refused the item, or cannot be reached. The message says why. |
+| `assert_failed` | `passkey_assert`: the SDK's authenticator did not sign (a passkey whose key cannot be read, or without a user handle). |
 | `denied` | The other device refused the login (`device_poll`). |
 | `expired` | The login with a device was not approved in time: ask again. |
 | `no_passkey` | No passkey of the account opens its keys (a passkey without PRF, or none for this vault). |

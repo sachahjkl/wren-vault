@@ -362,6 +362,36 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             Ok(c) => done(json!({ "totp": c.code.as_str(), "period": c.period, "remaining": c.remaining })),
             Err(f) => fail(f),
         },
+        Op::PasskeysFor { rp_id, allow } => match session.passkeys_for(&rp_id, &allow).await {
+            Ok(rows) => {
+                let rows: Vec<Value> = rows
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "item": r.item, "name": r.name, "username": r.username,
+                            "credential_id": r.credential_id, "user_handle": r.user_handle,
+                        })
+                    })
+                    .collect();
+                done(json!({ "rows": rows }))
+            }
+            Err(f) => fail(f),
+        },
+        Op::PasskeyAssert {
+            item,
+            credential_id,
+            rp_id,
+            client_data_hash,
+        } => match session
+            .passkey_assert(&item, &credential_id, &rp_id, &client_data_hash)
+            .await
+        {
+            Ok(s) => done(json!({
+                "authenticator_data": s.authenticator_data, "signature": s.signature,
+                "user_handle": s.user_handle, "credential_id": s.credential_id,
+            })),
+            Err(f) => fail(f),
+        },
         Op::Keepalive => (None, Next::Continue),
     }
 }
@@ -449,8 +479,13 @@ mod tests {
             json!({"id": 11, "op": "save", "item": "", "name": "a.example", "uri": "https://a.example/",
                    "username": "me", "password": "pw"}),
             json!({"id": 12, "op": "save", "item": "x", "password": "pw"}),
+            json!({"id": 13, "op": "passkeys_for", "rp_id": "a.example"}),
+            json!({"id": 14, "op": "passkey_assert", "item": "x", "credential_id": "aWQ", "rp_id": "a.example",
+                   "client_data_hash": "aGFzaA"}),
         ])
         .await;
+        assert_eq!(answers[12]["error"], "locked");
+        assert_eq!(answers[13]["error"], "locked");
         assert_eq!(answers[10]["error"], "locked");
         assert_eq!(answers[11]["error"], "locked");
         assert_eq!(answers[7]["error"], "locked");
