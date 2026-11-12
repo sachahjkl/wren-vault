@@ -16,18 +16,21 @@ use bitwarden_api_api::models::SyncResponseModel;
 use bitwarden_auth::token_management::PasswordManagerTokenHandler;
 use bitwarden_core::{
     Client, ClientBuilder, ClientSettings, DeviceType, OrganizationId,
-    auth::{JwtToken, login::TwoFactorEmailRequest},
+    auth::{AuthRequestResponse, JwtToken, login::TwoFactorEmailRequest},
     client::{
         login_method::UserLoginMethod,
         persisted_state::{AUTHENTICATION_TOKENS, AuthenticationTokens, USER_LOGIN_METHOD},
     },
     key_management::{
-        MasterPasswordAuthenticationData, MasterPasswordUnlockData,
+        MasterPasswordAuthenticationData, MasterPasswordUnlockData, WebAuthnPrfUnlockOption,
         account_cryptographic_state::WrappedAccountCryptographicState,
-        crypto::{InitOrgCryptoRequest, InitUserCryptoMethod, InitUserCryptoRequest},
+        crypto::{AuthRequestMethod, InitOrgCryptoRequest, InitUserCryptoMethod, InitUserCryptoRequest},
     },
 };
-use bitwarden_crypto::{Kdf, UnsignedSharedKey, safe::PasswordProtectedKeyEnvelope};
+use bitwarden_crypto::{
+    EncString, Kdf, KeyDecryptable, Pkcs8PrivateKeyBytes, PrivateKey, SymmetricCryptoKey, UnsignedSharedKey,
+    derive_symmetric_key_from_prf, safe::PasswordProtectedKeyEnvelope,
+};
 use bitwarden_crypto_sync_handler::CryptoSyncData;
 use bitwarden_sync::{SyncClientExt, SyncHandler, SyncHandlerError, SyncRequest};
 use bitwarden_vault::{Cipher, CipherType, CipherView, UriMatchType, VaultClientExt, generate_totp};
@@ -36,11 +39,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     HELPER_VERSION,
-    identity::{self, CLIENT_ID, Device, Second, TokenAnswer},
+    identity::{self, Approval, Assertion, CLIENT_ID, Device, PrfOption, Second, TokenAnswer},
     matching::{self, Page, Rule},
     protocol::Row,
     state::{LOGIN_API_KEY, LOGIN_PASSWORD, PIN_TRIES, STATE_VERSION, Saved, Store},
-    tokens::{Secrets, TokenStore},
+    tokens::{Remembered, Secrets, TokenStore},
 };
 
 /// A failed request: a stable code (README.md, "Errors") and a sentence for the person. Never a secret.
@@ -74,6 +77,105 @@ fn no_account() -> Failure {
     Failure::new("no_account", "No account is remembered: log in.")
 }
 
+fn cannot_reach() -> Failure {
+    Failure::new(
+        "network",
+        "The server cannot be reached. Check its address and the network connection.",
+    )
+}
+
+fn expired() -> Failure {
+    Failure::new(
+        "expired",
+        "The login with a device expired without an approval. Ask again.",
+    )
+}
+
+fn unsupported_two_factor() -> Failure {
+    Failure::new(
+        "unsupported_two_factor",
+        "This account asks for a second step that the Vault does not support (Duo, a security key, YubiKey). Add an authenticator app or the email code to the account, or log in with a device, a passkey or the account's API key.",
+    )
+}
+
+/// The failure of a token answer that is no login and no next step.
+fn refusal(answer: TokenAnswer) -> Failure {
+    match answer {
+        TokenAnswer::Captcha => Failure::new(
+            "captcha_required",
+            "The server asks to solve a captcha first. Log in once on the web vault, then try again here.",
+        ),
+        TokenAnswer::BadAuthEmail => Failure::new(
+            "bad_auth_email",
+            "The server refused the account's email (its Auth-Email header). Check the email and log in again.",
+        ),
+        TokenAnswer::Locked(message) => Failure::new("account_locked", message),
+        TokenAnswer::Refused(message) => Failure::new("bad_credentials", message),
+        TokenAnswer::Tokens { .. }
+        | TokenAnswer::TwoFactor { .. }
+        | TokenAnswer::DeviceCode
+        | TokenAnswer::Unexpected => {
+            Failure::new("login_failed", "The server's answer to the login is not understood.")
+        }
+    }
+}
+
+/// The server's sentence in an error answer of the API (`message`, or the first of the model's errors).
+fn error_message(body: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(body).ok()?;
+    let text = v
+        .get("message")
+        .or_else(|| v.get("Message"))
+        .and_then(Value::as_str)?
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The sync's passkeys that unlock the account, for the state (null when none).
+fn prf_options_value(crypto: &CryptoSyncData) -> Result<Value, Failure> {
+    match crypto
+        .user_decryption
+        .as_ref()
+        .and_then(|d| d.web_authn_prf_options.as_ref())
+        .filter(|o| !o.is_empty())
+    {
+        Some(options) => to_value(options),
+        None => Ok(Value::Null),
+    }
+}
+
+/// The account's passkeys that unlock it, from the state.
+fn prf_options_of(saved: &Saved) -> Vec<WebAuthnPrfUnlockOption> {
+    serde_json::from_value(saved.prf_options.clone()).unwrap_or_default()
+}
+
+/// The user key from a passkey's PRF output (base64url) and its keys: the PRF key (the SDK's
+/// `derive_symmetric_key_from_prf`) unwraps the private key, which decapsulates the user key. Returns the user key in
+/// base64, for `InitUserCryptoMethod::DecryptedKey`.
+fn prf_open(prf: &str, option: &PrfOption) -> Result<Zeroizing<String>, Failure> {
+    let private: EncString = option.encrypted_private_key.parse().map_err(|_| prf_wrong())?;
+    let user: UnsignedSharedKey = option.encrypted_user_key.parse().map_err(|_| prf_wrong())?;
+    prf_user_key(prf, &private, &user)
+}
+
+fn prf_wrong() -> Failure {
+    Failure::new(
+        "passkey_failed",
+        "The passkey's answer does not open the vault. Use the passkey that was registered for this account, or the master password.",
+    )
+}
+
+fn prf_user_key(prf: &str, private: &EncString, user: &UnsignedSharedKey) -> Result<Zeroizing<String>, Failure> {
+    let bytes = Zeroizing::new(identity::base64url_decode(prf).ok_or_else(prf_wrong)?);
+    let prf_key: SymmetricCryptoKey = derive_symmetric_key_from_prf(&bytes).map_err(|_| prf_wrong())?;
+    let der: Vec<u8> = private.decrypt_with_key(&prf_key).map_err(|_| prf_wrong())?;
+    let private_key = PrivateKey::from_der(&Pkcs8PrivateKeyBytes::from(der)).map_err(|_| prf_wrong())?;
+    // (the SDK's own login with a passkey and its auth requests decapsulate the same way, unsigned)
+    #[allow(deprecated)]
+    let user_key = user.decapsulate_key_unsigned(&private_key).map_err(|_| prf_wrong())?;
+    Ok(Zeroizing::new(user_key.to_base64().to_string()))
+}
+
 /// The server and the client identity that `hello` gave.
 #[derive(Clone)]
 pub struct Config {
@@ -93,6 +195,8 @@ pub struct Account {
     pub login: &'static str,
     /// A PIN can unlock it.
     pub pin: bool,
+    /// One of its passkeys can unlock it (the PRF extension).
+    pub passkey: bool,
 }
 
 /// One `login` request: a first step (a password), a second step (a code and its provider), or a code sent again.
@@ -104,6 +208,44 @@ pub struct LoginRequest<'a> {
     /// "authenticator" (the default), "email" or "device".
     pub provider: Option<&'a str>,
     pub resend: bool,
+    /// With a two-step code: the server remembers this device for two-step login.
+    pub remember: bool,
+}
+
+/// What a poll of a login with another device gave.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DevicePoll {
+    /// The other device has not answered yet.
+    Pending,
+    /// Approved: logged in and unlocked. The account's email.
+    Done(String),
+}
+
+/// How long the server keeps an auth request (Bitwarden's 15 minutes): past it, a poll is `expired` without asking.
+pub const AUTH_REQUEST_LIFE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A login with another device that waits for its approval.
+struct DeviceWait {
+    email: String,
+    id: String,
+    device_id: String,
+    started: std::time::Instant,
+    /// The key pair and the access code (the SDK's `new_auth_request`): its private key opens the approval's key.
+    auth: AuthRequestResponse,
+}
+
+/// What opens the account's keys at the end of a login.
+enum Opener<'a> {
+    Password(&'a str),
+    /// Another device's approval: the request's private key and the key it encapsulated (the user key, or the master
+    /// key with `master_key`).
+    AuthRequest {
+        auth: AuthRequestResponse,
+        key: String,
+        master_key: bool,
+    },
+    /// The user key itself, in base64 (a passkey's PRF output opened it).
+    UserKey(Zeroizing<String>),
 }
 
 /// What a login gave.
@@ -125,6 +267,11 @@ pub enum LoginOutcome {
 pub enum Unlock<'a> {
     Password(&'a str),
     Pin(&'a str),
+    /// A passkey of the account: its PRF output (base64url) and its credential id (base64url; "" when unknown).
+    Passkey {
+        prf: &'a str,
+        credential_id: &'a str,
+    },
 }
 
 /// The values of one login for a fill or a copy. Zeroed when dropped.
@@ -199,6 +346,12 @@ pub struct Session {
     domains: Vec<Vec<String>>,
     /// A login that waits for its second step.
     waiting: Option<Waiting>,
+    /// A login with another device that waits for its approval.
+    device_wait: Option<DeviceWait>,
+    /// A passkey login between its options and its assertion: the options' token, and their relying party.
+    passkey: Option<(Zeroizing<String>, String)>,
+    /// This profile's device identifier (`Store::device`), once read or made.
+    device: Option<String>,
     /// The secrets last written to the token store (they are written again only when they change).
     secrets: Option<Secrets>,
 }
@@ -214,6 +367,9 @@ impl Default for Session {
             ciphers: Vec::new(),
             domains: Vec::new(),
             waiting: None,
+            device_wait: None,
+            passkey: None,
+            device: None,
             secrets: None,
         }
     }
@@ -272,27 +428,74 @@ impl Session {
                     LOGIN_PASSWORD
                 },
                 pin: s.has_pin(),
+                passkey: !prf_options_of(s).is_empty(),
             },
             None => Account {
                 state: "none",
                 email: String::new(),
                 login: LOGIN_PASSWORD,
                 pin: false,
+                passkey: false,
             },
         })
     }
 
     fn forget_waiting(&mut self) {
         self.waiting = None; // (zeroed by its drop)
+        self.device_wait = None;
+        self.passkey = None;
     }
 
-    /// The device identifier for a login of `email`: the remembered one of that account, else a new one.
-    fn device_for(&self, email: &str) -> String {
-        self.saved
-            .as_ref()
-            .filter(|s| s.email.eq_ignore_ascii_case(email))
-            .map(|s| s.device_id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    /// The device identifier for a login of `email`: the remembered one of that account, else this profile's.
+    fn device_for(&mut self, email: &str) -> String {
+        if let Some(s) = self.saved.as_ref().filter(|s| s.email.eq_ignore_ascii_case(email)) {
+            return s.device_id.clone();
+        }
+        self.profile_device()
+    }
+
+    /// This profile's device identifier: kept in `device.json` (it outlives a logout), made at its first use.
+    fn profile_device(&mut self) -> String {
+        if let Some(d) = &self.device {
+            return d.clone();
+        }
+        let id = self.store.device().unwrap_or_else(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            // (not kept: the next login makes another one, as before this file existed)
+            let _ = self.store.save_device(&id);
+            id
+        });
+        self.device = Some(id.clone());
+        id
+    }
+
+    /// The token of a two-step login that the server remembers for `device` and `email`.
+    async fn remembered_token(&self, device: &str, email: &str) -> Option<Zeroizing<String>> {
+        let tokens = self.tokens.clone();
+        let device = device.to_string();
+        let email = email.to_string();
+        blocking(move || {
+            tokens
+                .load_remembered(&device)
+                .token_of(&email)
+                .map(|t| Zeroizing::new(t.to_string()))
+        })
+        .await
+        .flatten()
+    }
+
+    /// Keeps (`Some`) or forgets (`None`) that token.
+    async fn remember_token(&self, device: &str, email: &str, token: Option<String>) {
+        let tokens = self.tokens.clone();
+        let device = device.to_string();
+        let email = email.to_string();
+        let token = token.map(Zeroizing::new);
+        blocking(move || {
+            let mut r: Remembered = tokens.load_remembered(&device);
+            r.set(&email, token.as_deref().map(String::as_str));
+            let _ = tokens.save_remembered(&device, &r);
+        })
+        .await;
     }
 
     /// `login`. A first step carries the password; a second step the code and its provider (the password is the one
@@ -316,40 +519,64 @@ impl Session {
                 }
             },
         };
-        if req.resend && req.provider == Some("email") {
-            let client = new_client(&config, &device_id);
-            let request = TwoFactorEmailRequest {
-                password: password.to_string(),
-                email: req.email.to_string(),
+        if req.resend {
+            // (a resend that fails keeps the login waiting: the person can ask again or type a code already mailed)
+            let sent = match req.provider {
+                Some("email") => {
+                    let client = new_client(&config, &device_id);
+                    let request = TwoFactorEmailRequest {
+                        password: password.to_string(),
+                        email: req.email.to_string(),
+                    };
+                    let sent = client.auth().send_two_factor_email(&request).await.is_ok();
+                    drop(request); // (the zeroizing allocator clears the password's memory)
+                    sent
+                }
+                _ => resend_device_code(&config, &device_id, req.email, &password).await,
             };
-            let sent = client.auth().send_two_factor_email(&request).await;
-            drop(request); // (the zeroizing allocator clears the password's memory)
-            if sent.is_err() {
-                return Err(Failure::new("network", "The server did not send the code."));
-            }
             self.waiting = Some(Waiting {
                 email: req.email.to_string(),
                 password: password.to_string(),
                 device_id,
                 providers: providers.clone(),
             });
-            return Ok(LoginOutcome::NeedTwoFactor {
-                providers,
-                email_sent: true,
+            if !sent {
+                return Err(Failure::new(
+                    "network",
+                    "The server did not send a new code. Ask again, or type the code already mailed.",
+                ));
+            }
+            return Ok(if req.provider == Some("email") {
+                LoginOutcome::NeedTwoFactor {
+                    providers,
+                    email_sent: true,
+                }
+            } else {
+                LoginOutcome::NeedDeviceCode
             });
         }
         let code = req.code.map(str::trim);
+        // (a first step goes with the token of an earlier "remember me", when this device has one for the account)
+        let remembered = match code {
+            None => self.remembered_token(&device_id, req.email).await,
+            Some(_) => None,
+        };
         let second = match (code, req.provider) {
             (Some(c), Some("device")) => Some(Second::DeviceCode(c)),
             (Some(c), p) => Some(Second::TwoFactor {
                 provider: p.and_then(identity::provider_id).unwrap_or(0),
                 code: c,
+                remember: req.remember,
             }),
-            (None, _) => None,
+            (None, _) => remembered.as_deref().map(|t| Second::Remembered(t.as_str())),
         };
         let result = self
             .password_step(&config, req.email, &password, second.as_ref(), device_id.clone())
             .await;
+        if remembered.is_some() && matches!(result, Ok(LoginOutcome::NeedTwoFactor { .. })) {
+            // (the server forgot this device: its token is of no use any more)
+            self.remember_token(&device_id, req.email, None).await;
+        }
         match &result {
             Ok(LoginOutcome::NeedTwoFactor { providers, .. }) => {
                 self.waiting = Some(Waiting {
@@ -382,12 +609,11 @@ impl Session {
         device_id: String,
     ) -> Result<LoginOutcome, Failure> {
         let client = new_client(config, &device_id);
-        let kdf = client.auth().prelogin(email.to_string()).await.map_err(|_| {
-            Failure::new(
-                "network",
-                "The server cannot be reached, or it does not know this account.",
-            )
-        })?;
+        let kdf = client
+            .auth()
+            .prelogin(email.to_string())
+            .await
+            .map_err(|_| cannot_reach())?;
         let hash = {
             let auth = MasterPasswordAuthenticationData::derive(password, &kdf, email)
                 .map_err(|_| Failure::new("unsupported_account", "The account's key settings are not supported."))?;
@@ -407,26 +633,318 @@ impl Session {
                 access_token,
                 refresh_token,
                 expires_in,
+                two_factor_token,
+                prf: _,
             } => {
                 set_tokens(&client, access_token, refresh_token, expires_in).await;
-                self.finish_login(config, client, device_id, Some(email), password, Login::Password)
-                    .await?;
+                if let Some(t) = two_factor_token {
+                    self.remember_token(&device_id, email, Some(t)).await;
+                }
+                self.finish_login(
+                    config,
+                    client,
+                    device_id,
+                    Some(email),
+                    Opener::Password(password),
+                    Login::Password,
+                )
+                .await?;
                 Ok(LoginOutcome::Done)
             }
-            TokenAnswer::TwoFactor { providers } if providers.is_empty() => Err(Failure::new(
-                "unsupported_two_factor",
-                "This account asks for a second step that the Vault does not support (Duo, a security key, YubiKey). Add an authenticator app or the email code to the account, or log in with its API key.",
-            )),
+            TokenAnswer::TwoFactor { providers } if providers.is_empty() => Err(unsupported_two_factor()),
             TokenAnswer::TwoFactor { providers } => {
                 let email_sent = providers == ["email"];
                 Ok(LoginOutcome::NeedTwoFactor { providers, email_sent })
             }
             TokenAnswer::DeviceCode => Ok(LoginOutcome::NeedDeviceCode),
-            TokenAnswer::Refused(message) => Err(Failure::new("bad_credentials", message)),
-            TokenAnswer::Unexpected => Err(Failure::new(
-                "login_failed",
-                "The server's answer to the login is not understood.",
+            other => Err(refusal(other)),
+        }
+    }
+
+    /// `password_hint`: the server mails the account's master password hint (it answers the same for an unknown
+    /// email: nobody learns which emails have an account).
+    pub async fn password_hint(&mut self, email: &str) -> Result<(), Failure> {
+        let config = self.config.clone().ok_or_else(no_hello)?;
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(Failure::new("bad_request", "The hint needs the account's email."));
+        }
+        let client = new_client(&config, &self.profile_device());
+        let body = serde_json::json!({ "email": email }).to_string();
+        match http(&client, Server::Api, "/accounts/password-hint", Some(body.as_str())).await {
+            Some((status, _)) if (200..300).contains(&status) => Ok(()),
+            Some((status, text)) if status == 400 => Err(Failure::new(
+                "bad_request",
+                error_message(&text).unwrap_or_else(|| "The server refused to send the hint.".into()),
             )),
+            Some(_) => Err(Failure::new("network", "The server refused to send the hint.")),
+            None => Err(cannot_reach()),
+        }
+    }
+
+    /// `device_request`: a login that another device of the account approves (Bitwarden's "log in with device"). The
+    /// helper makes a key pair and an access code (the SDK's `new_auth_request`), sends the public key to the server,
+    /// and returns the fingerprint phrase that the other device shows too.
+    pub async fn device_request(&mut self, email: &str) -> Result<String, Failure> {
+        let config = self.config.clone().ok_or_else(no_hello)?;
+        self.forget_waiting();
+        let email = email.trim().to_string();
+        if email.is_empty() {
+            return Err(Failure::new(
+                "bad_request",
+                "A login with a device needs the account's email.",
+            ));
+        }
+        let device_id = self.device_for(&email);
+        let client = new_client(&config, &device_id);
+        let auth = client
+            .auth()
+            .new_auth_request(&email)
+            .map_err(|_| Failure::new("decrypt", "The keys of the request cannot be made."))?;
+        // (type 0: AuthenticateAndUnlock; the server takes the device type from the Device-Type header)
+        let body = serde_json::json!({
+            "email": email, "publicKey": auth.public_key.to_string(), "deviceIdentifier": device_id,
+            "accessCode": auth.access_code, "type": 0,
+        })
+        .to_string();
+        let Some((status, text)) = http(&client, Server::Api, "/auth-requests", Some(body.as_str())).await else {
+            return Err(cannot_reach());
+        };
+        if !(200..300).contains(&status) {
+            return Err(Failure::new(
+                "login_failed",
+                error_message(&text)
+                    .unwrap_or_else(|| "The server refused the login with a device. Is the email right?".into()),
+            ));
+        }
+        let id = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("id")
+                    .or_else(|| v.get("Id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| Failure::new("login_failed", "The server's answer to the request is not understood."))?;
+        let fingerprint = auth.fingerprint.clone();
+        self.device_wait = Some(DeviceWait {
+            email,
+            id,
+            device_id,
+            started: std::time::Instant::now(),
+            auth,
+        });
+        Ok(fingerprint)
+    }
+
+    /// `device_poll`: one look at the request (the browser asks again on its own timer). Approved: the token request
+    /// with the access code, the sync, the keys from the approval.
+    pub async fn device_poll(&mut self) -> Result<DevicePoll, Failure> {
+        let config = self.config.clone().ok_or_else(no_hello)?;
+        let Some(wait) = self.device_wait.take() else {
+            return Err(Failure::new("bad_request", "No login with a device waits."));
+        };
+        if wait.started.elapsed() > AUTH_REQUEST_LIFE {
+            return Err(expired());
+        }
+        let client = new_client(&config, &wait.device_id);
+        let path = format!(
+            "/auth-requests/{}/response?code={}",
+            wait.id,
+            url::form_urlencoded::byte_serialize(wait.auth.access_code.as_bytes()).collect::<String>()
+        );
+        let Some((status, text)) = http(&client, Server::Api, &path, None).await else {
+            // (a network that comes back: the next poll may succeed)
+            self.device_wait = Some(wait);
+            return Err(cannot_reach());
+        };
+        if status == 404 {
+            return Err(expired());
+        }
+        let approval = if (200..300).contains(&status) {
+            identity::parse_approval(&text)
+        } else {
+            None
+        };
+        let (key, master_key) = match approval {
+            Some(Approval::Pending) => {
+                self.device_wait = Some(wait);
+                return Ok(DevicePoll::Pending);
+            }
+            Some(Approval::Denied) => {
+                return Err(Failure::new("denied", "The other device refused the login."));
+            }
+            Some(Approval::Approved { key, master_key }) => (key, master_key),
+            None => {
+                self.device_wait = Some(wait);
+                return Err(Failure::new(
+                    "login_failed",
+                    "The server's answer to the request is not understood.",
+                ));
+            }
+        };
+        let form = identity::auth_request_form(
+            &wait.email,
+            &wait.auth.access_code,
+            &wait.id,
+            &Device {
+                identifier: &wait.device_id,
+                name: &config.device_name,
+            },
+            None,
+        );
+        match token_request(&client, &form, Some(&wait.email)).await? {
+            TokenAnswer::Tokens {
+                access_token,
+                refresh_token,
+                expires_in,
+                ..
+            } => {
+                set_tokens(&client, access_token, refresh_token, expires_in).await;
+                let DeviceWait {
+                    email, device_id, auth, ..
+                } = wait;
+                let opener = Opener::AuthRequest { auth, key, master_key };
+                let email = self
+                    .finish_login(&config, client, device_id, Some(&email), opener, Login::Password)
+                    .await?;
+                Ok(DevicePoll::Done(email))
+            }
+            TokenAnswer::TwoFactor { .. } => Err(Failure::new(
+                "unsupported_two_factor",
+                "The server asks for a second step after the approval: log in with the master password.",
+            )),
+            other => Err(refusal(other)),
+        }
+    }
+
+    /// `passkey_options`: the options of a passkey ceremony, as JSON text. `login`: the server's assertion options
+    /// (their token is kept for `login_passkey`). `unlock`: the account's passkeys that unlock it, with a random
+    /// challenge, for the relying party `rp_id` (the saved one of a passkey login first).
+    pub async fn passkey_options(&mut self, purpose: &str, rp_id: &str) -> Result<String, Failure> {
+        let config = self.config.clone().ok_or_else(no_hello)?;
+        match purpose {
+            "login" => {
+                self.forget_waiting();
+                let client = new_client(&config, &self.profile_device());
+                let Some((status, text)) =
+                    http(&client, Server::Identity, "/accounts/webauthn/assertion-options", None).await
+                else {
+                    return Err(cannot_reach());
+                };
+                let v = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .filter(|_| (200..300).contains(&status));
+                let token = v
+                    .as_ref()
+                    .and_then(|v| v.get("token").or_else(|| v.get("Token")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let options = v
+                    .as_ref()
+                    .and_then(|v| v.get("options").or_else(|| v.get("Options")))
+                    .and_then(identity::passkey_request_options);
+                let (Some(token), Some(options)) = (token, options) else {
+                    return Err(Failure::new(
+                        "login_failed",
+                        "The server does not offer a login with a passkey (or its answer is not understood).",
+                    ));
+                };
+                let rp = options.get("rpId").and_then(Value::as_str).unwrap_or(rp_id).to_string();
+                self.passkey = Some((Zeroizing::new(token), rp));
+                Ok(options.to_string())
+            }
+            "unlock" => {
+                let saved = self.saved.as_ref().ok_or_else(no_account)?;
+                let credentials: Vec<(String, Vec<String>)> = prf_options_of(saved)
+                    .into_iter()
+                    .filter_map(|o| o.credential_id.map(|id| (id, o.transports.unwrap_or_default())))
+                    .collect();
+                if credentials.is_empty() {
+                    return Err(Failure::new(
+                        "no_passkey",
+                        "No passkey of this account unlocks the vault.",
+                    ));
+                }
+                let rp = if saved.rp_id.is_empty() {
+                    rp_id
+                } else {
+                    saved.rp_id.as_str()
+                };
+                if rp.is_empty() {
+                    return Err(Failure::new(
+                        "bad_request",
+                        "An unlock with a passkey needs its relying party.",
+                    ));
+                }
+                let mut challenge = Vec::with_capacity(32);
+                challenge.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+                challenge.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+                let options = identity::passkey_unlock_options(rp, &identity::base64url(&challenge), &credentials);
+                Ok(options.to_string())
+            }
+            _ => Err(Failure::new(
+                "bad_request",
+                "A passkey's options are for a login or an unlock.",
+            )),
+        }
+    }
+
+    /// `login_passkey`: the assertion of the ceremony whose options `passkey_options` gave, and its PRF output
+    /// (base64url). The server checks the assertion; the PRF output opens the passkey's keys here, never there.
+    pub async fn login_passkey(&mut self, assertion: &Assertion<'_>, prf: &str) -> Result<String, Failure> {
+        let config = self.config.clone().ok_or_else(no_hello)?;
+        let Some((token, rp)) = self.passkey.take() else {
+            return Err(Failure::new("bad_request", "Ask for the passkey's options first."));
+        };
+        let device_id = self.profile_device();
+        let client = new_client(&config, &device_id);
+        let response = identity::passkey_response(assertion);
+        let form = identity::webauthn_form(
+            &token,
+            &response,
+            &Device {
+                identifier: &device_id,
+                name: &config.device_name,
+            },
+        );
+        match token_request(&client, &form, None).await? {
+            TokenAnswer::Tokens {
+                access_token,
+                refresh_token,
+                expires_in,
+                prf: option,
+                ..
+            } => {
+                let Some(option) = option else {
+                    return Err(Failure::new(
+                        "passkey_no_unlock",
+                        "This passkey logs in but does not open the vault: turn on its use for encryption in the web vault, or log in with the master password.",
+                    ));
+                };
+                let user_key = prf_open(prf, &option)?;
+                set_tokens(&client, access_token, refresh_token, expires_in).await;
+                let email = self
+                    .finish_login(
+                        &config,
+                        client,
+                        device_id,
+                        None,
+                        Opener::UserKey(user_key),
+                        Login::Password,
+                    )
+                    .await?;
+                if let Some(saved) = self.saved.as_mut() {
+                    saved.rp_id = rp;
+                    let _ = self.store.save(saved);
+                }
+                Ok(email)
+            }
+            TokenAnswer::TwoFactor { .. } => Err(Failure::new(
+                "unsupported_two_factor",
+                "The server asks for a second step after the passkey: log in with the master password.",
+            )),
+            other => Err(refusal(other)),
         }
     }
 
@@ -456,35 +974,37 @@ impl Session {
             },
         );
         match token_request(&client, &form, None).await? {
+            // (an API key login has no second step, and its answer carries no passkey material)
             TokenAnswer::Tokens {
                 access_token,
                 refresh_token,
                 expires_in,
+                ..
             } => {
                 set_tokens(&client, access_token, refresh_token, expires_in).await;
                 let login = Login::ApiKey {
                     client_id: client_id.to_string(),
                     client_secret: Zeroizing::new(client_secret.trim().to_string()),
                 };
-                self.finish_login(&config, client, device_id, None, password, login)
+                self.finish_login(&config, client, device_id, None, Opener::Password(password), login)
                     .await
             }
-            TokenAnswer::Refused(message) => Err(Failure::new("bad_credentials", message)),
-            TokenAnswer::TwoFactor { .. } | TokenAnswer::DeviceCode | TokenAnswer::Unexpected => Err(Failure::new(
+            TokenAnswer::TwoFactor { .. } | TokenAnswer::DeviceCode => Err(Failure::new(
                 "login_failed",
                 "The server's answer to the API key login is not understood.",
             )),
+            other => Err(refusal(other)),
         }
     }
 
-    /// After the tokens: the sync, the keys with the master password, the state. Returns the account's email.
+    /// After the tokens: the sync, the keys (`opener`), the state. Returns the account's email.
     async fn finish_login(
         &mut self,
         config: &Config,
         client: Client,
         device_id: String,
         email: Option<&str>,
-        password: &str,
+        opener: Opener<'_>,
         login: Login,
     ) -> Result<String, Failure> {
         let captured = sync_capture(&client).await?;
@@ -521,22 +1041,59 @@ impl Session {
             .and_then(|t| t.access_token.parse::<JwtToken>().ok())
             .map(|j| j.sub)
             .unwrap_or_default();
+        let (method, wrong) = match opener {
+            Opener::Password(password) => (
+                InitUserCryptoMethod::MasterPasswordUnlock {
+                    password: password.to_string(),
+                    master_password_unlock: unlock.clone(),
+                },
+                Failure::new("bad_password", "The master password does not open this account's keys."),
+            ),
+            Opener::AuthRequest { auth, key, master_key } => {
+                let bad = || {
+                    Failure::new(
+                        "decrypt",
+                        "The other device's approval does not open this account's keys.",
+                    )
+                };
+                let method = if master_key {
+                    AuthRequestMethod::MasterKey {
+                        protected_master_key: key.parse().map_err(|_| bad())?,
+                        auth_request_key: unlock.master_key_wrapped_user_key.clone(),
+                    }
+                } else {
+                    AuthRequestMethod::UserKey {
+                        protected_user_key: key.parse().map_err(|_| bad())?,
+                    }
+                };
+                (
+                    InitUserCryptoMethod::AuthRequest {
+                        request_private_key: auth.private_key,
+                        method,
+                    },
+                    bad(),
+                )
+            }
+            Opener::UserKey(key) => (
+                InitUserCryptoMethod::DecryptedKey {
+                    decrypted_user_key: key.to_string(),
+                },
+                prf_wrong(),
+            ),
+        };
         let request = InitUserCryptoRequest {
             user_id: user_id.parse().ok(),
             kdf_params: unlock.kdf.clone(),
             email: email.clone(),
             account_cryptographic_state: account_crypto.clone(),
-            method: InitUserCryptoMethod::MasterPasswordUnlock {
-                password: password.to_string(),
-                master_password_unlock: unlock.clone(),
-            },
+            method,
             upgrade_token: None,
         };
         client
             .crypto()
             .initialize_user_crypto(request)
             .await
-            .map_err(|_| Failure::new("bad_password", "The master password does not open this account's keys."))?;
+            .map_err(|_| wrong)?;
         let (kind, api_client_id, method) = match login {
             Login::Password => (
                 LOGIN_PASSWORD,
@@ -581,6 +1138,7 @@ impl Session {
             api_client_id,
             master_password_unlock: to_value(&unlock)?,
             account_crypto: to_value(&account_crypto)?,
+            prf_options: prf_options_value(&captured.crypto)?,
             ..Default::default()
         };
         self.secrets = None;
@@ -616,6 +1174,24 @@ impl Session {
                 InitUserCryptoMethod::PinEnvelope {
                     pin: pin.to_string(),
                     pin_protected_user_key_envelope: envelope,
+                }
+            }
+            Unlock::Passkey { prf, credential_id } => {
+                let options = prf_options_of(&saved);
+                if options.is_empty() {
+                    return Err(Failure::new(
+                        "no_passkey",
+                        "No passkey of this account unlocks the vault.",
+                    ));
+                }
+                // (the passkey the authenticator used; all of them when its id is not known)
+                let key = options
+                    .iter()
+                    .filter(|o| credential_id.is_empty() || o.credential_id.as_deref() == Some(credential_id))
+                    .find_map(|o| prf_user_key(prf, &o.encrypted_private_key, &o.encrypted_user_key).ok())
+                    .ok_or_else(prf_wrong)?;
+                InitUserCryptoMethod::DecryptedKey {
+                    decrypted_user_key: key.to_string(),
                 }
             }
         };
@@ -660,7 +1236,10 @@ impl Session {
                 let _ = self.store.save(&saved);
             }
         } else if !opened {
-            return Err(Failure::new("bad_password", "The master password is wrong."));
+            return Err(match with {
+                Unlock::Passkey { .. } => prf_wrong(),
+                _ => Failure::new("bad_password", "The master password is wrong."),
+            });
         }
         init_organizations(&client, &saved.org_keys).await;
         self.ciphers = saved
@@ -744,6 +1323,8 @@ impl Session {
         if let Some(account_crypto) = &captured.crypto.account_cryptographic_state {
             saved.account_crypto = to_value(account_crypto)?;
         }
+        // (a passkey added or removed in the web vault since: the unlock dialog offers it, or not, from now on)
+        saved.prf_options = prf_options_value(&captured.crypto)?;
         self.ciphers = captured.ciphers;
         self.domains = captured.domains;
         self.remember(&mut saved, captured.org_keys).await?;
@@ -1025,7 +1606,7 @@ fn new_client(config: &Config, device_id: &str) -> Client {
         user_agent: format!("Wren/{} wren-vault/{}", config.client_version, HELPER_VERSION),
         device_type: DeviceType::UnknownBrowser,
         device_identifier: Some(device_id.to_string()),
-        bitwarden_client_version: None,
+        bitwarden_client_version: Some(BITWARDEN_CLIENT_VERSION.to_string()),
         bitwarden_package_type: None,
     };
     ClientBuilder::new()
@@ -1033,6 +1614,11 @@ fn new_client(config: &Config, device_id: &str) -> Client {
         .with_token_handler(Arc::new(PasswordManagerTokenHandler::default()))
         .build()
 }
+
+/// The Bitwarden client version this helper speaks for (the `Bitwarden-Client-Version` header). The identity server
+/// refuses a token without it, and refuses an account with V2 encryption below 2026.10.1 (its ClientVersionValidator).
+/// It names the clients of the pinned SDK's release: raise it with the SDK pin.
+pub const BITWARDEN_CLIENT_VERSION: &str = "2026.11.0";
 
 /// Sends a token request with the SDK's HTTP client of the identity server (its TLS roots, its user agent and its
 /// `Device-Type` header) and reads the answer.
@@ -1052,6 +1638,57 @@ async fn token_request(client: &Client, form: &str, auth_email: Option<&str>) ->
     let status = response.status().as_u16();
     let text = Zeroizing::new(response.text().await.map_err(|_| network())?);
     Ok(identity::parse_token_answer(status, &text))
+}
+
+/// Which of the configured servers a request goes to.
+#[derive(Clone, Copy)]
+enum Server {
+    Identity,
+    Api,
+}
+
+/// One request without a session to the identity server or the API, with the SDK's HTTP client (its TLS roots, its
+/// user agent, its `Device-Type` header): a POST of `body` (JSON), else a GET. The status and the body, zeroed when
+/// dropped; `None` when the server did not answer.
+async fn http(client: &Client, server: Server, path: &str, body: Option<&str>) -> Option<(u16, Zeroizing<String>)> {
+    let configurations = client.internal.get_api_configurations();
+    let (base, http) = match server {
+        Server::Identity => (
+            &configurations.identity_config.base_path,
+            &configurations.identity_config.client,
+        ),
+        Server::Api => (&configurations.api_config.base_path, &configurations.api_config.client),
+    };
+    let url = format!("{base}{path}");
+    let request = match body {
+        Some(b) => http
+            .post(url)
+            .header("content-type", "application/json; charset=utf-8")
+            .body(b.to_string()),
+        None => http.get(url),
+    };
+    let response = request.header("accept", "application/json").send().await.ok()?;
+    let status = response.status().as_u16();
+    let text = Zeroizing::new(response.text().await.ok()?);
+    Some((status, text))
+}
+
+/// Asks the server to mail a new code of the new-device verification (`POST {api}/accounts/resend-new-device-otp`,
+/// with the master password hash: what Bitwarden's clients send). True when it says it did.
+async fn resend_device_code(config: &Config, device_id: &str, email: &str, password: &str) -> bool {
+    let client = new_client(config, device_id);
+    let Ok(kdf) = client.auth().prelogin(email.to_string()).await else {
+        return false;
+    };
+    let Ok(auth) = MasterPasswordAuthenticationData::derive(password, &kdf, email) else {
+        return false;
+    };
+    let hash = Zeroizing::new(auth.master_password_authentication_hash.to_string());
+    let body = Zeroizing::new(serde_json::json!({ "email": email, "masterPasswordHash": hash.as_str() }).to_string());
+    matches!(
+        http(&client, Server::Api, "/accounts/resend-new-device-otp", Some(body.as_str())).await,
+        Some((status, _)) if (200..300).contains(&status)
+    )
 }
 
 /// The tokens of a login into the client's state, where the SDK's token handler reads and renews them.

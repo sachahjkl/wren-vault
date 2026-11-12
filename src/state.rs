@@ -60,6 +60,23 @@ pub struct Saved {
     /// Wrong PINs since the last good one. At `PIN_TRIES` the envelope is deleted.
     #[serde(default)]
     pub pin_failures: u32,
+    /// The account's passkeys that can unlock it, as the last sync gave them (the SDK's PRF unlock options: the
+    /// credential's id and transports, its private key wrapped by its PRF key, the user key encapsulated to it); null
+    /// or empty when none. Nothing in them opens the vault without the authenticator.
+    #[serde(default)]
+    pub prf_options: Value,
+    /// The relying party of the account's passkeys (the web vault's domain), from a passkey login; "" when the account
+    /// never logged in with one here (the browser then names it).
+    #[serde(default)]
+    pub rp_id: String,
+}
+
+/// The file of this profile's device identifier (`Store::device`).
+pub const DEVICE_FILE: &str = "device.json";
+
+#[derive(Serialize, Deserialize, Default)]
+struct DeviceFile {
+    device_id: String,
 }
 
 /// Wrong PINs that delete the PIN's envelope (README.md, "PIN").
@@ -114,7 +131,34 @@ impl Store {
         fs::rename(&tmp, dir.join(STATE_FILE))
     }
 
-    /// Deletes the state (logout), and a state of an older version.
+    /// This profile's device identifier, from `device.json`; `None` when there is none yet or nothing persists. It
+    /// outlives a logout: the account's list of devices keeps one entry for this browser, and the server's "remember
+    /// me" of two-step login stays valid for it.
+    pub fn device(&self) -> Option<String> {
+        let path = self.dir.as_ref()?.join(DEVICE_FILE);
+        let bytes = fs::read(path).ok()?;
+        let d: DeviceFile = serde_json::from_slice(&bytes).ok()?;
+        (!d.device_id.is_empty()).then_some(d.device_id)
+    }
+
+    /// Keeps the device identifier (a public value: the server shows it in the account's device list).
+    pub fn save_device(&self, id: &str) -> std::io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        make_private_dir(dir)?;
+        let bytes = serde_json::to_vec(&DeviceFile {
+            device_id: id.to_string(),
+        })
+        .map_err(std::io::Error::other)?;
+        let tmp = dir.join(format!("{DEVICE_FILE}.tmp"));
+        {
+            let mut f = private_file(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, dir.join(DEVICE_FILE))
+    }
+
+    /// Deletes the state (logout), and a state of an older version. The device file stays.
     pub fn wipe(&self) {
         if let Some(dir) = &self.dir {
             let _ = fs::remove_file(dir.join(STATE_FILE));
@@ -186,6 +230,19 @@ mod tests {
         }
         store.wipe();
         assert!(store.load().is_none());
+    }
+
+    #[test]
+    fn the_device_outlives_a_wipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_str().unwrap(), true);
+        assert!(store.device().is_none());
+        store.save_device("11111111-2222-3333-4444-555555555555").unwrap();
+        store.wipe();
+        assert_eq!(store.device().as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+        let memory = Store::new("", false);
+        memory.save_device("x").unwrap();
+        assert!(memory.device().is_none());
     }
 
     #[test]

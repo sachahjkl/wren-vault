@@ -15,9 +15,10 @@ use zeroize::Zeroizing;
 use crate::{
     PROTOCOL_VERSION,
     frame::{FrameReader, write_frame},
+    identity::Assertion,
     matching::Page,
     protocol::{self, Op, Request},
-    sdk::{Config, Failure, LoginOutcome, LoginRequest, Session, Unlock},
+    sdk::{Config, DevicePoll, Failure, LoginOutcome, LoginRequest, Session, Unlock},
 };
 
 /// What the loop does after an answer.
@@ -120,7 +121,7 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             match session.hello(config, &state_dir, persist) {
                 Ok(a) => done(json!({
                     "protocol": PROTOCOL_VERSION, "helper_version": crate::HELPER_VERSION,
-                    "account": a.state, "email": a.email, "login": a.login, "pin": a.pin,
+                    "account": a.state, "email": a.email, "login": a.login, "pin": a.pin, "passkey": a.passkey,
                 })),
                 Err(f) => fail(f),
             }
@@ -135,6 +136,7 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             code,
             provider,
             resend,
+            remember,
         } => {
             let request = LoginRequest {
                 email: &email,
@@ -142,6 +144,7 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
                 code: code.as_ref().map(|c| c.as_str()),
                 provider: provider.as_deref(),
                 resend,
+                remember,
             };
             let result = session.login(request).await;
             drop(password);
@@ -170,18 +173,71 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
                 Err(f) => fail(f),
             }
         }
-        Op::Unlock { password, pin } => {
-            let result = match (&password, &pin) {
-                (_, Some(p)) => session.unlock(Unlock::Pin(p.as_str())).await,
-                (Some(p), None) => session.unlock(Unlock::Password(p.as_str())).await,
-                (None, None) => Err(Failure {
+        Op::PasswordHint { email } => match session.password_hint(&email).await {
+            Ok(()) => done(json!({})),
+            Err(f) => fail(f),
+        },
+        Op::DeviceRequest { email } => match session.device_request(&email).await {
+            Ok(fingerprint) => done(json!({ "fingerprint": fingerprint })),
+            Err(f) => fail(f),
+        },
+        Op::DevicePoll => match session.device_poll().await {
+            Ok(DevicePoll::Pending) => done(json!({ "result": "pending" })),
+            Ok(DevicePoll::Done(email)) => done(json!({ "result": "ok", "email": email })),
+            Err(f) => fail(f),
+        },
+        Op::PasskeyOptions { purpose, rp_id } => match session.passkey_options(&purpose, &rp_id).await {
+            Ok(options) => done(json!({ "options": options })),
+            Err(f) => fail(f),
+        },
+        Op::LoginPasskey {
+            credential_id,
+            authenticator_data,
+            client_data_json,
+            signature,
+            user_handle,
+            prf,
+        } => {
+            let assertion = Assertion {
+                id: &credential_id,
+                authenticator_data: &authenticator_data,
+                client_data_json: &client_data_json,
+                signature: &signature,
+                user_handle: &user_handle,
+            };
+            let result = session.login_passkey(&assertion, prf.as_str()).await;
+            drop(prf);
+            match result {
+                Ok(email) => done(json!({ "result": "ok", "email": email })),
+                Err(f) => fail(f),
+            }
+        }
+        Op::Unlock {
+            password,
+            pin,
+            prf,
+            credential_id,
+        } => {
+            let result = match (&password, &pin, &prf) {
+                (_, _, Some(p)) => {
+                    session
+                        .unlock(Unlock::Passkey {
+                            prf: p.as_str(),
+                            credential_id: &credential_id,
+                        })
+                        .await
+                }
+                (_, Some(p), None) => session.unlock(Unlock::Pin(p.as_str())).await,
+                (Some(p), None, None) => session.unlock(Unlock::Password(p.as_str())).await,
+                (None, None, None) => Err(Failure {
                     code: "bad_request",
-                    message: "An unlock needs the master password or the PIN.".into(),
+                    message: "An unlock needs the master password, the PIN or a passkey.".into(),
                     tries_left: None,
                 }),
             };
             drop(password);
             drop(pin);
+            drop(prf);
             match result {
                 Ok(()) => done(json!({})),
                 Err(f) => fail(f),
@@ -288,7 +344,7 @@ mod tests {
     }
 
     fn hello(id: u64, dir: &str, idle_seconds: u64) -> Value {
-        json!({"id": id, "op": "hello", "protocol": 3, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
+        json!({"id": id, "op": "hello", "protocol": 4, "state_dir": dir, "identity_url": "http://127.0.0.1:9/identity",
                "api_url": "http://127.0.0.1:9/api", "persist": !dir.is_empty(), "idle_seconds": idle_seconds})
     }
 
@@ -314,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remote_http_server_is_refused() {
-        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 3, "state_dir": "",
+        let answers = exchange(&[json!({"id": 1, "op": "hello", "protocol": 4, "state_dir": "",
             "identity_url": "http://example.com/identity", "api_url": "https://example.com/api"})])
         .await;
         assert_eq!(answers[0]["error"], "bad_server");
@@ -353,6 +409,28 @@ mod tests {
         assert_eq!(answers[4]["error"], "no_account");
         assert_eq!(answers[5]["error"], "locked");
         assert_eq!(answers[6]["error"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn the_new_steps_need_their_first_step() {
+        let answers = exchange(&[
+            hello(1, "", 0),
+            json!({"id": 2, "op": "device_poll"}),
+            json!({"id": 3, "op": "login_passkey", "credential_id": "i", "authenticator_data": "a",
+                   "client_data_json": "c", "signature": "s", "prf": "p"}),
+            json!({"id": 4, "op": "passkey_options", "purpose": "unlock", "rp_id": "vault.example"}),
+            json!({"id": 5, "op": "unlock", "prf": "cHJm", "credential_id": "aWQ"}),
+            json!({"id": 6, "op": "passkey_options", "purpose": "other"}),
+            json!({"id": 7, "op": "password_hint", "email": " "}),
+        ])
+        .await;
+        assert_eq!(answers[1]["error"], "bad_request", "no login with a device waits");
+        assert_eq!(answers[2]["error"], "bad_request", "no passkey options were asked");
+        assert_eq!(answers[3]["error"], "no_account");
+        assert_eq!(answers[4]["error"], "no_account");
+        assert_eq!(answers[5]["error"], "bad_request");
+        assert_eq!(answers[6]["error"], "bad_request");
+        assert_eq!(answers[0]["passkey"], false);
     }
 
     #[tokio::test]

@@ -46,6 +46,47 @@ impl Drop for Secrets {
     }
 }
 
+/// The file of the remembered two-step tokens when no system store answers.
+pub const REMEMBER_FILE: &str = "remember.json";
+
+/// The account name of the remembered two-step tokens in the system store: they are this device's, not one login's,
+/// and a logout keeps them (the server's "remember me" is for the device, as in Bitwarden's own clients).
+pub fn remember_account(device: &str) -> String {
+    format!("{device}.remember")
+}
+
+/// The two-step tokens that the server gave this device, one per account (the email in lower case). Zeroed when
+/// dropped.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct Remembered {
+    #[serde(default)]
+    pub tokens: Vec<(String, String)>,
+}
+
+impl Remembered {
+    pub fn token_of(&self, email: &str) -> Option<&str> {
+        let key = email.to_lowercase();
+        self.tokens.iter().find(|(e, _)| *e == key).map(|(_, t)| t.as_str())
+    }
+
+    /// Sets (`Some`) or forgets (`None`) the token of `email`.
+    pub fn set(&mut self, email: &str, token: Option<&str>) {
+        let key = email.to_lowercase();
+        self.tokens.retain(|(e, _)| *e != key);
+        if let Some(t) = token {
+            self.tokens.push((key, t.to_string()));
+        }
+    }
+}
+
+impl Drop for Remembered {
+    fn drop(&mut self) {
+        for (_, t) in &mut self.tokens {
+            t.zeroize();
+        }
+    }
+}
+
 /// A store of the system that keeps one text per account. `Err` means it did not answer or refused.
 pub trait SystemStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>, ()>;
@@ -92,32 +133,57 @@ impl TokenStore {
         self.system.get_or_init(platform_store).clone()
     }
 
-    fn file(&self) -> Option<PathBuf> {
-        self.dir.as_ref().map(|d| d.join(TOKENS_FILE))
-    }
-
     /// The secrets of `account`: the system store's first, else the file's. Blocks.
     pub fn load(&self, account: &str) -> Option<Secrets> {
-        self.dir.as_ref()?;
-        if let Some(system) = self.system()
-            && let Ok(Some(text)) = system.get(account)
-        {
-            let text = Zeroizing::new(text);
-            if let Ok(s) = serde_json::from_str::<Secrets>(&text) {
-                return Some(s);
-            }
-        }
-        let bytes = Zeroizing::new(fs::read(self.file()?).ok()?);
-        serde_json::from_slice::<Secrets>(&bytes).ok()
+        self.load_as(account, TOKENS_FILE)
     }
 
     /// Keeps the secrets of `account`: in the system store when it takes them (and the file goes), else in the file.
     /// Blocks.
     pub fn save(&self, account: &str, secrets: &Secrets) -> std::io::Result<Place> {
-        let (Some(dir), Some(file)) = (self.dir.as_ref(), self.file()) else {
+        self.save_as(account, TOKENS_FILE, secrets)
+    }
+
+    /// Forgets the secrets of `account` in both places (logout). Blocks.
+    pub fn wipe(&self, account: &str) {
+        self.wipe_as(account, TOKENS_FILE)
+    }
+
+    /// The tokens of two-step logins that the server remembers for this device (`remember_account`). Blocks.
+    pub fn load_remembered(&self, device: &str) -> Remembered {
+        self.load_as(&remember_account(device), REMEMBER_FILE)
+            .unwrap_or_default()
+    }
+
+    /// Keeps them (an empty list: they go). Blocks.
+    pub fn save_remembered(&self, device: &str, r: &Remembered) -> std::io::Result<Place> {
+        if r.tokens.is_empty() {
+            self.wipe_as(&remember_account(device), REMEMBER_FILE);
+            return Ok(Place::Memory);
+        }
+        self.save_as(&remember_account(device), REMEMBER_FILE, r)
+    }
+
+    fn load_as<T: serde::de::DeserializeOwned>(&self, account: &str, file_name: &str) -> Option<T> {
+        let dir = self.dir.as_ref()?;
+        if let Some(system) = self.system()
+            && let Ok(Some(text)) = system.get(account)
+        {
+            let text = Zeroizing::new(text);
+            if let Ok(s) = serde_json::from_str::<T>(&text) {
+                return Some(s);
+            }
+        }
+        let bytes = Zeroizing::new(fs::read(dir.join(file_name)).ok()?);
+        serde_json::from_slice::<T>(&bytes).ok()
+    }
+
+    fn save_as<T: Serialize>(&self, account: &str, file_name: &str, value: &T) -> std::io::Result<Place> {
+        let Some(dir) = self.dir.as_ref() else {
             return Ok(Place::Memory);
         };
-        let text = Zeroizing::new(serde_json::to_string(secrets).map_err(std::io::Error::other)?);
+        let file = dir.join(file_name);
+        let text = Zeroizing::new(serde_json::to_string(value).map_err(std::io::Error::other)?);
         if let Some(system) = self.system()
             && system.set(account, &text).is_ok()
         {
@@ -125,7 +191,7 @@ impl TokenStore {
             return Ok(Place::System);
         }
         crate::state::make_private_dir(dir)?;
-        let tmp = dir.join(format!("{TOKENS_FILE}.tmp"));
+        let tmp = dir.join(format!("{file_name}.tmp"));
         {
             let mut f = crate::state::private_file(&tmp)?;
             f.write_all(text.as_bytes())?;
@@ -135,17 +201,12 @@ impl TokenStore {
         Ok(Place::File)
     }
 
-    /// Forgets the secrets of `account` in both places (logout). Blocks.
-    pub fn wipe(&self, account: &str) {
-        if self.dir.is_none() {
-            return;
-        }
+    fn wipe_as(&self, account: &str, file_name: &str) {
+        let Some(dir) = self.dir.as_ref() else { return };
         if let Some(system) = self.system() {
             let _ = system.delete(account);
         }
-        if let Some(file) = self.file() {
-            let _ = fs::remove_file(file);
-        }
+        let _ = fs::remove_file(dir.join(file_name));
     }
 
     pub fn dir(&self) -> Option<&Path> {
@@ -297,6 +358,25 @@ mod tests {
         let up = TokenStore::with_system(Some(path.clone()), Some(Arc::new(Fake::default())));
         assert_eq!(up.save("device", &secrets()).unwrap(), Place::System);
         assert!(!path.join(TOKENS_FILE).exists());
+    }
+
+    #[test]
+    fn remembered_two_step_tokens_outlive_a_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        for system in [None, Some(Arc::new(Fake::default()) as Arc<dyn SystemStore>)] {
+            let store = TokenStore::with_system(Some(dir.path().to_path_buf()), system);
+            let mut r = store.load_remembered("device");
+            assert!(r.token_of("a@b.c").is_none());
+            r.set("A@B.c", Some("tok"));
+            store.save_remembered("device", &r).unwrap();
+            store.save("device", &secrets()).unwrap();
+            store.wipe("device");
+            assert_eq!(store.load_remembered("device").token_of("a@b.C"), Some("tok"));
+            r.set("a@b.c", None);
+            store.save_remembered("device", &r).unwrap();
+            assert!(store.load_remembered("device").token_of("a@b.c").is_none());
+            assert!(!dir.path().join(REMEMBER_FILE).exists());
+        }
     }
 
     #[test]

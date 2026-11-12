@@ -25,7 +25,7 @@ pub mod state;
 pub mod tokens;
 
 /// The version of the pipe protocol. A browser that sends another version gets an error from `hello`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The version of this helper, as `hello` reports it.
 pub const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");

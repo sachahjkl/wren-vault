@@ -46,6 +46,33 @@ pub enum Op {
         provider: Option<String>,
         #[serde(default)]
         resend: bool,
+        /// With a two-step code: the server remembers this device for two-step login.
+        #[serde(default)]
+        remember: bool,
+    },
+    /// Ask the server to mail the account's master password hint.
+    PasswordHint { email: String },
+    /// Start a login that another device of the account approves; the answer is the fingerprint phrase.
+    DeviceRequest { email: String },
+    /// One look at that login's approval.
+    DevicePoll,
+    /// The options of a passkey ceremony: `purpose` "login" or "unlock"; `rp_id` the web vault's domain (an unlock's
+    /// relying party when no passkey login named one).
+    PasskeyOptions {
+        purpose: String,
+        #[serde(default)]
+        rp_id: String,
+    },
+    /// Log in with the passkey ceremony's assertion (each value base64url) and its PRF output. (`credential_id`: the
+    /// request's own `id` is the frame's.)
+    LoginPasskey {
+        credential_id: String,
+        authenticator_data: String,
+        client_data_json: String,
+        signature: String,
+        #[serde(default)]
+        user_handle: String,
+        prf: Secret,
     },
     /// Log in with the account's personal API key, then unlock with the master password.
     LoginApiKey {
@@ -53,12 +80,17 @@ pub enum Op {
         client_secret: Secret,
         password: Secret,
     },
-    /// Unlock the remembered account with the master password or the PIN.
+    /// Unlock the remembered account with the master password, the PIN, or a passkey's PRF output (`prf`, with the
+    /// `credential_id` the authenticator used).
     Unlock {
         #[serde(default)]
         password: Option<Secret>,
         #[serde(default)]
         pin: Option<Secret>,
+        #[serde(default)]
+        prf: Option<Secret>,
+        #[serde(default)]
+        credential_id: String,
     },
     /// Lock: the helper answers, then exits.
     Lock,
@@ -175,10 +207,11 @@ mod tests {
                 code,
                 provider,
                 resend,
+                remember,
             } => {
                 assert_eq!(email, "a@b.c");
                 assert_eq!(password.map(|p| p.0.clone()).as_deref(), Some("pw"));
-                assert!(code.is_none() && provider.is_none() && !resend);
+                assert!(code.is_none() && provider.is_none() && !resend && !remember);
             }
             _ => panic!("not a login"),
         }
@@ -198,16 +231,31 @@ mod tests {
             r.op,
             Op::Unlock {
                 password: None,
-                pin: Some(_)
+                pin: Some(_),
+                prf: None,
+                ..
             }
         ));
+        let r: Request = serde_json::from_str(r#"{"id":12,"op":"unlock","prf":"cHJm","credential_id":"aWQ"}"#).unwrap();
+        assert!(matches!(r.op, Op::Unlock { prf: Some(_), .. }));
+        let r: Request = serde_json::from_str(r#"{"id":13,"op":"password_hint","email":"a@b.c"}"#).unwrap();
+        assert!(matches!(r.op, Op::PasswordHint { .. }));
+        let r: Request = serde_json::from_str(r#"{"id":14,"op":"device_request","email":"a@b.c"}"#).unwrap();
+        assert!(matches!(r.op, Op::DeviceRequest { .. }));
+        let r: Request = serde_json::from_str(r#"{"id":15,"op":"passkey_options","purpose":"login"}"#).unwrap();
+        assert!(matches!(r.op, Op::PasskeyOptions { .. }));
+        let r: Request = serde_json::from_str(
+            r#"{"id":16,"op":"login_passkey","credential_id":"i","authenticator_data":"a","client_data_json":"c","signature":"s","prf":"p"}"#,
+        )
+        .unwrap();
+        assert!(matches!(r.op, Op::LoginPasskey { .. }));
         let r: Request = serde_json::from_str(r#"{"id":8,"op":"pin_set","pin":"1234"}"#).unwrap();
         assert!(matches!(r.op, Op::PinSet { .. }));
         let r: Request = serde_json::from_str(r#"{"id":10,"op":"search","query":"git"}"#).unwrap();
         assert!(matches!(r.op, Op::Search { limit: 0, .. }));
         let r: Request = serde_json::from_str(r#"{"id":11,"op":"totp","item":"x"}"#).unwrap();
         assert!(matches!(r.op, Op::Totp { .. }));
-        for op in ["pin_clear", "logout", "keepalive", "sync"] {
+        for op in ["pin_clear", "logout", "keepalive", "sync", "device_poll"] {
             let text = format!(r#"{{"id":9,"op":"{op}"}}"#);
             assert!(serde_json::from_str::<Request>(&text).is_ok(), "{op}");
         }

@@ -10,7 +10,10 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_string_contains, header, method, path},
 };
-use wren_vault::sdk::{Config, LoginOutcome, LoginRequest, Session};
+use wren_vault::{
+    identity::Assertion,
+    sdk::{Config, DevicePoll, LoginOutcome, LoginRequest, Session},
+};
 
 /// The account's KDF: PBKDF2 with the smallest count the server allows, so the test derives fast.
 async fn mount_prelogin(server: &MockServer) {
@@ -65,6 +68,11 @@ async fn a_wrong_password_is_bad_credentials() {
         .and(body_string_contains("deviceName=Wren"))
         // the server refuses a password grant without the account's email in this header ("Auth-Email header invalid")
         .and(header("auth-email", "dXNlckBleGFtcGxlLmNvbQ"))
+        // the server refuses any token without the client's version ("No client version header found")
+        .and(header(
+            "bitwarden-client-version",
+            wren_vault::sdk::BITWARDEN_CLIENT_VERSION,
+        ))
         .respond_with(refused("Username or password is incorrect. Try again."))
         .expect(1)
         .mount(&server)
@@ -376,6 +384,347 @@ async fn a_server_that_does_not_answer_is_a_network_error() {
         Ok(_) => panic!("no server"),
     };
     assert_eq!(err.code, "network");
+}
+
+#[tokio::test]
+async fn refusals_have_their_own_codes() {
+    for (body, code) in [
+        (
+            json!({ "error": "invalid_grant", "HCaptcha_SiteKey": "site" }),
+            "captcha_required",
+        ),
+        (
+            json!({ "error": "invalid_grant", "error_description": "Auth-Email header invalid." }),
+            "bad_auth_email",
+        ),
+        (
+            json!({ "error": "invalid_grant", "ErrorModel": { "Message": "This user is locked out." } }),
+            "account_locked",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_prelogin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut s = session_for(&server);
+        assert_eq!(
+            s.login(first("user@example.com", "password"))
+                .await
+                .err()
+                .map(|e| e.code),
+            Some(code)
+        );
+    }
+}
+
+#[tokio::test]
+async fn remember_me_asks_the_server_to_remember_this_device() {
+    let server = MockServer::start().await;
+    mount_prelogin(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .and(body_string_contains("twoFactorToken=123456"))
+        .and(body_string_contains("twoFactorRemember=1"))
+        .respond_with(refused("Two-step token is invalid. Try again."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    let request = LoginRequest {
+        code: Some("123456"),
+        provider: Some("authenticator"),
+        remember: true,
+        ..first("user@example.com", "password")
+    };
+    assert_eq!(s.login(request).await.err().map(|e| e.code), Some("bad_credentials"));
+}
+
+#[tokio::test]
+async fn a_new_device_code_is_sent_again_by_its_own_endpoint() {
+    let server = MockServer::start().await;
+    mount_prelogin(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/resend-new-device-otp"))
+        .and(body_string_contains("user@example.com"))
+        .and(body_string_contains("masterPasswordHash"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .and(body_string_contains("newDeviceOtp=135790"))
+        .respond_with(refused("Invalid new device OTP."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "device_error",
+            "ErrorModel": { "Message": "new device verification required", "Object": "error" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    assert_eq!(
+        s.login(first("user@example.com", "password")).await.ok(),
+        Some(LoginOutcome::NeedDeviceCode)
+    );
+    let resend = LoginRequest {
+        email: "user@example.com",
+        provider: Some("device"),
+        resend: true,
+        ..Default::default()
+    };
+    assert_eq!(s.login(resend).await.ok(), Some(LoginOutcome::NeedDeviceCode));
+    let code = LoginRequest {
+        email: "user@example.com",
+        code: Some("135790"),
+        provider: Some("device"),
+        ..Default::default()
+    };
+    assert_eq!(s.login(code).await.err().map(|e| e.code), Some("bad_credentials"));
+}
+
+#[tokio::test]
+async fn a_resend_that_fails_keeps_the_login_waiting() {
+    let server = MockServer::start().await;
+    mount_prelogin(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/two-factor/send-email-login"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .and(body_string_contains("twoFactorToken=424242"))
+        .respond_with(refused("Two-step token is invalid. Try again."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "invalid_grant",
+            "TwoFactorProviders2": { "0": null, "1": { "Email": "u***@example.com" } }
+        })))
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    assert!(matches!(
+        s.login(first("user@example.com", "password")).await,
+        Ok(LoginOutcome::NeedTwoFactor { .. })
+    ));
+    let resend = LoginRequest {
+        email: "user@example.com",
+        provider: Some("email"),
+        resend: true,
+        ..Default::default()
+    };
+    assert_eq!(s.login(resend).await.err().map(|e| e.code), Some("network"));
+    // (the kept password is still there: the code goes with it)
+    let code = LoginRequest {
+        email: "user@example.com",
+        code: Some("424242"),
+        provider: Some("email"),
+        ..Default::default()
+    };
+    assert_eq!(s.login(code).await.err().map(|e| e.code), Some("bad_credentials"));
+}
+
+#[tokio::test]
+async fn the_hint_is_asked_of_the_api() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/password-hint"))
+        .and(body_string_contains("user@example.com"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    assert!(s.password_hint(" user@example.com ").await.is_ok());
+    assert_eq!(s.password_hint("").await.err().map(|e| e.code), Some("bad_request"));
+    assert_eq!(
+        session_at("http://127.0.0.1:1")
+            .password_hint("a@b.c")
+            .await
+            .err()
+            .map(|e| e.code),
+        Some("network")
+    );
+}
+
+#[tokio::test]
+async fn a_login_with_a_device_waits_then_sends_the_access_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth-requests"))
+        .and(body_string_contains("publicKey"))
+        .and(body_string_contains("accessCode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "req-1", "requestApproved": null })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // first a pending answer, then the approval
+    Mock::given(method("GET"))
+        .and(path("/api/auth-requests/req-1/response"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "req-1", "requestApproved": null })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/auth-requests/req-1/response"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "req-1", "requestApproved": true, "key": "4.bm90IGEga2V5", "masterPasswordHash": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .and(body_string_contains("authRequest=req-1"))
+        .and(body_string_contains("grant_type=password"))
+        .and(header("auth-email", "dXNlckBleGFtcGxlLmNvbQ"))
+        .respond_with(refused("The request is not valid."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    let fingerprint = s.device_request("user@example.com").await.unwrap();
+    assert!(fingerprint.split('-').count() >= 4, "a phrase of words: {fingerprint}");
+    assert_eq!(s.device_poll().await.ok(), Some(DevicePoll::Pending));
+    assert_eq!(s.device_poll().await.err().map(|e| e.code), Some("bad_credentials"));
+    // (the request is spent: another poll has nothing to look at)
+    assert_eq!(s.device_poll().await.err().map(|e| e.code), Some("bad_request"));
+    let token = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/identity/connect/token")
+        .unwrap();
+    let code = url::form_urlencoded::parse(&token.body)
+        .find(|(k, _)| k == "password")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    assert_eq!(code.len(), 25, "the access code goes in place of the hash");
+}
+
+#[tokio::test]
+async fn a_refused_or_lost_device_request_is_said() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth-requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "req-2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/auth-requests/req-2/response"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requestApproved": false })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/auth-requests/req-2/response"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    s.device_request("user@example.com").await.unwrap();
+    assert_eq!(s.device_poll().await.err().map(|e| e.code), Some("denied"));
+    s.device_request("user@example.com").await.unwrap();
+    assert_eq!(s.device_poll().await.err().map(|e| e.code), Some("expired"));
+}
+
+#[tokio::test]
+async fn a_passkey_login_asks_for_the_prf_and_never_sends_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/identity/accounts/webauthn/assertion-options"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "options": { "challenge": "Y2hhbGxlbmdl", "timeout": 60000, "rpId": "vault.example",
+                         "allowCredentials": [], "userVerification": "required", "status": "ok" },
+            "token": "options-token"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .and(body_string_contains("grant_type=webauthn"))
+        .and(body_string_contains("token=options-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a", "expires_in": 60, "refresh_token": "r", "token_type": "Bearer"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    let options: serde_json::Value = serde_json::from_str(&s.passkey_options("login", "").await.unwrap()).unwrap();
+    assert_eq!(options["rpId"], "vault.example");
+    assert_eq!(
+        options["extensions"]["prf"]["eval"]["first"],
+        wren_vault::identity::PRF_SALT
+    );
+    let assertion = Assertion {
+        id: "Y3JlZA",
+        authenticator_data: "YWQ",
+        client_data_json: "Y2Q",
+        signature: "c2ln",
+        user_handle: "dWg",
+    };
+    let prf = "c2VjcmV0LXByZi1vdXRwdXQtb2YtMzItYnl0ZXMtLS0";
+    // (the server's answer has no PRF keys: the passkey is not one for the vault's encryption)
+    assert_eq!(
+        s.login_passkey(&assertion, prf).await.err().map(|e| e.code),
+        Some("passkey_no_unlock")
+    );
+    for r in server.received_requests().await.unwrap() {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert!(!body.contains(prf), "the PRF output never goes to the server");
+    }
+    // (the options' token is spent)
+    assert_eq!(
+        s.login_passkey(&assertion, prf).await.err().map(|e| e.code),
+        Some("bad_request")
+    );
+}
+
+#[tokio::test]
+async fn a_passkey_whose_keys_do_not_open_is_said() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/identity/accounts/webauthn/assertion-options"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "options": { "challenge": "Y2hhbGxlbmdl", "rpId": "vault.example" }, "token": "t"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/identity/connect/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a", "expires_in": 60, "token_type": "Bearer",
+            "UserDecryptionOptions": { "WebAuthnPrfOption": { "EncryptedPrivateKey": "not a key", "EncryptedUserKey": "nor this" } }
+        })))
+        .mount(&server)
+        .await;
+    let mut s = session_for(&server);
+    s.passkey_options("login", "").await.unwrap();
+    let assertion = Assertion {
+        id: "Y3JlZA",
+        ..Default::default()
+    };
+    assert_eq!(
+        s.login_passkey(&assertion, "c2VjcmV0LXByZi1vdXRwdXQtb2YtMzItYnl0ZXMtLS0")
+            .await
+            .err()
+            .map(|e| e.code),
+        Some("passkey_failed")
+    );
 }
 
 #[tokio::test]

@@ -40,6 +40,11 @@ files must be present (the Nix flake provides them).
 
 ## Protocol
 
+Version 4 (this helper 0.4.0). Changes from version 3: new requests `password_hint`, `device_request`, `device_poll`,
+`passkey_options` and `login_passkey`; `login` takes `remember`; `unlock` takes `prf` and `credential_id`; `hello`
+answers `passkey`; the errors `denied`, `expired`, `no_passkey` and `account_locked`. Every token request carries the
+headers `Auth-Email` (a password login) and `Bitwarden-Client-Version`, without which the server refuses it.
+
 Version 3 (this helper 0.3.0). Changes from version 2: new requests `search` and `totp`; `fill` takes the field
 `"totp"`; `logins_for` applies the rules `StartsWith` and `Exact` and the account's equivalent domains, its rows carry
 the match types `equivalent`, `starts_with` and `exact`, and its answer carries `equivalent`; the error `no_totp`.
@@ -74,10 +79,10 @@ request but `hello` needs a `hello` before it (`no_hello`).
 
 | op | Request fields | Answer fields |
 |---|---|---|
-| `hello` | `protocol` (3), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool) |
-| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true) | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
+| `hello` | `protocol` (4), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
+| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
 | `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email` |
-| `unlock` | `password` or `pin` | none; a `bad_pin` error carries `tries_left` |
+| `unlock` | `password`, `pin`, or `prf` and `credential_id` (a passkey) | none; a `bad_pin` error carries `tries_left` |
 | `lock` | none | none; the helper then exits |
 | `logout` | none | none; the helper forgets the account (state, tokens, PIN), then exits |
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
@@ -87,6 +92,11 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `search` | `query` (words), `limit` (0: 50; never more than 50) | `rows`: `{id, name, username, uri, has_totp}`, sorted by name; `uri` is the item's first `http` or `https` address (`""` if none) |
 | `fill` | `item` (a row id), `fields` (a list of `"username"`, `"password"`, `"totp"`) | `username`, `password` (only the asked fields that the item has), `totp` (the current code) |
 | `totp` | `item` | `totp` (the current code), `period` and `remaining` (seconds) |
+| `password_hint` | `email` | none; the server mails the hint to the account's address |
+| `device_request` | `email` | `fingerprint` (the phrase the other device shows) |
+| `device_poll` | none | `result`: `"pending"`, or `"ok"` (unlocked) with `email` |
+| `passkey_options` | `purpose` (`"login"` or `"unlock"`), `rp_id` (the web vault's domain) | `options` (the WebAuthn request's options, JSON text) |
+| `login_passkey` | `credential_id`, `authenticator_data`, `client_data_json`, `signature`, `user_handle` (each base64url), `prf` (the PRF output, base64url) | `result` (`"ok"`), `email` |
 | `keepalive` | none | no answer; the idle deadline starts again |
 
 ### Login steps
@@ -134,6 +144,10 @@ its own timer, and sends `keepalive` while the person is active.
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
 | `no_item` | `fill` or `totp` names an item that is not a login of the vault. |
 | `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
+| `denied` | The other device refused the login (`device_poll`). |
+| `expired` | The login with a device was not approved in time: ask again. |
+| `no_passkey` | No passkey of the account opens its keys (a passkey without PRF, or none for this vault). |
+| `account_locked` | The server locked the account for now (too many attempts). The message is the server's. |
 | `decrypt` | The item cannot be decrypted, or the PIN cannot be set. |
 | `state_write`, `state_format` | The state directory (or the token store) cannot be written, or the saved state cannot be read. |
 
