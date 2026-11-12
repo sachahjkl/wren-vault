@@ -340,9 +340,10 @@ pub struct Code {
     pub remaining: u32,
 }
 
-/// The most rows that `search` returns when the browser names no bound, and the most it ever returns: the browser
-/// shows them in its palette, which needs a short list.
-pub const SEARCH_LIMIT: usize = 50;
+/// The rows of a page of `search` when the browser names no bound, and the most it ever takes in one: the browser
+/// pages through a long list as it scrolls (a page of 500 short rows stays far under a frame's bound).
+pub const SEARCH_PAGE: usize = 100;
+pub const SEARCH_PAGE_MAX: usize = 500;
 
 /// A password login that waits for its second step: what the next `login` needs.
 struct Waiting {
@@ -1470,14 +1471,21 @@ impl Session {
         Ok(rows)
     }
 
-    /// `search`: the logins, cards and identities whose name, user name (a card's brand and last digits, an identity's
-    /// name or email) or addresses hold every word of `query`, sorted by name, at most `limit` (0 or more than
-    /// `SEARCH_LIMIT`: `SEARCH_LIMIT`). No password, no card number.
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Row>, Failure> {
+    /// `search`: the logins, cards and identities (of `kinds`; empty: all three) whose name, user name (a card's brand
+    /// and last digits, an identity's name or email) or addresses hold every word of `query` (empty: every item), sorted
+    /// by name: the page from `offset`, at most `limit` rows (0: `SEARCH_PAGE`; at most `SEARCH_PAGE_MAX`), and how many
+    /// match in all. No password, no card number.
+    pub async fn search(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        kinds: &[String],
+    ) -> Result<(Vec<Row>, usize), Failure> {
         let limit = if limit == 0 {
-            SEARCH_LIMIT
+            SEARCH_PAGE
         } else {
-            limit.min(SEARCH_LIMIT)
+            limit.min(SEARCH_PAGE_MAX)
         };
         let mut rows = Vec::new();
         for view in self.views().await? {
@@ -1487,6 +1495,9 @@ impl Session {
             let Some((kind, username)) = summary(&view) else {
                 continue;
             };
+            if !kinds.is_empty() && !kinds.iter().any(|k| k == kind) {
+                continue;
+            }
             let login = view.login.as_ref().filter(|_| kind == "login");
             let uris: Vec<&str> = login
                 .and_then(|l| l.uris.as_ref())
@@ -1520,8 +1531,9 @@ impl Session {
             });
         }
         rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        rows.truncate(limit);
-        Ok(rows)
+        let total = rows.len();
+        let page: Vec<Row> = rows.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
     }
 
     /// The decrypted login of one item.
@@ -2602,9 +2614,16 @@ mod tests {
             "the item goes encrypted"
         );
         // (no sync: the server's answer is in the helper's items and its state)
-        let rows = s.search("a.example", 0).await.unwrap_or_default();
-        assert_eq!(rows.len(), 1);
+        let (rows, total) = s.search("a.example", 0, 0, &[]).await.unwrap_or_default();
+        assert_eq!((rows.len(), total), (1, 1));
         assert_eq!((rows[0].kind, rows[0].username.as_str()), ("login", "me"));
+        // a page past the matches: no row, the same total; a kind it is not: no match at all; an empty query: everything
+        let (rows, total) = s.search("a.example", 1, 0, &[]).await.unwrap_or_default();
+        assert_eq!((rows.len(), total), (0, 1));
+        let (rows, total) = s.search("", 0, 0, &["card".to_string()]).await.unwrap_or_default();
+        assert_eq!((rows.len(), total), (0, 0));
+        let (rows, total) = s.search("", 0, 0, &["login".to_string()]).await.unwrap_or_default();
+        assert_eq!((rows.len(), total), (1, 1));
         let page = Page {
             url: "https://www.a.example/",
             host: "www.a.example",

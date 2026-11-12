@@ -281,10 +281,15 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
                 Err(f) => fail(f),
             }
         }
-        Op::Search { query, limit } => match session.search(&query, limit).await {
-            Ok(rows) => {
+        Op::Search {
+            query,
+            offset,
+            limit,
+            kinds,
+        } => match session.search(&query, offset, limit, &kinds).await {
+            Ok((rows, total)) => {
                 let rows: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
-                done(json!({ "rows": rows }))
+                done(json!({ "rows": rows, "total": total }))
             }
             Err(f) => fail(f),
         },

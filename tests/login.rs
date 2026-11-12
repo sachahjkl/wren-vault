@@ -750,7 +750,7 @@ async fn sync_fill_and_pins_need_an_unlocked_vault() {
         ..Default::default()
     };
     assert_eq!(wren_vault::sdk::generate(&generate).map(|v| v.len()).ok(), Some(20));
-    assert_eq!(s.search("git", 0).await.err().map(|e| e.code), Some("locked"));
+    assert_eq!(s.search("git", 0, 0, &[]).await.err().map(|e| e.code), Some("locked"));
     assert_eq!(s.totp("id").await.err().map(|e| e.code), Some("locked"));
     assert_eq!(s.pin_set("1234").err().map(|e| e.code), Some("locked"));
     // (a locked vault asks the server nothing: no request reached the mock)

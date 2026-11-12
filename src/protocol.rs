@@ -116,9 +116,15 @@ pub enum Op {
     /// password, no code.
     Search {
         query: String,
-        /// The most rows to return (0: the helper's own bound).
+        /// The first match to return (a page of a long list: the browser asks for the next one as it scrolls).
+        #[serde(default)]
+        offset: usize,
+        /// The most rows to return (0: `SEARCH_PAGE`; never more than `SEARCH_PAGE_MAX`).
         #[serde(default)]
         limit: usize,
+        /// The kinds of items to list ("login", "card", "identity"); empty: all three.
+        #[serde(default)]
+        kinds: Vec<String>,
     },
     /// The values of one item, for a fill or a copy that the user asked for: `fields` lists a login's "username",
     /// "password", "totp" (the current code), a card's or an identity's fields (README.md, "Fill").
@@ -297,7 +303,13 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"id":8,"op":"pin_set","pin":"1234"}"#).unwrap();
         assert!(matches!(r.op, Op::PinSet { .. }));
         let r: Request = serde_json::from_str(r#"{"id":10,"op":"search","query":"git"}"#).unwrap();
-        assert!(matches!(r.op, Op::Search { limit: 0, .. }));
+        assert!(matches!(r.op, Op::Search { limit: 0, offset: 0, ref kinds, .. } if kinds.is_empty()));
+        let r: Request =
+            serde_json::from_str(r#"{"id":17,"op":"search","query":"","offset":100,"limit":100,"kinds":["card"]}"#)
+                .unwrap();
+        assert!(
+            matches!(r.op, Op::Search { offset: 100, limit: 100, ref kinds, .. } if kinds == &["card".to_string()])
+        );
         let r: Request = serde_json::from_str(r#"{"id":11,"op":"totp","item":"x"}"#).unwrap();
         assert!(matches!(r.op, Op::Totp { .. }));
         for op in ["pin_clear", "logout", "keepalive", "sync", "device_poll"] {

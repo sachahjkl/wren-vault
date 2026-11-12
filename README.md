@@ -43,7 +43,8 @@ files must be present (the Nix flake provides them).
 Version 5 (this helper 0.5.0). Changes from version 4: `hello` takes and answers `protocol` 5; new requests `save`
 (create or update a login, on the server and at once in the helper's copy of the vault) and `generate` (a password or a
 passphrase from the SDK's generator, also while locked); the rows of `search` list cards and identities too, and every
-row carries `kind`; `fill` gives the fields of a card or an identity; the error `save_failed`.
+row carries `kind`; `search` pages (`offset`, `limit` up to 500, `kinds`) and answers `total`; `fill` gives the fields
+of a card or an identity; the error `save_failed`.
 
 Version 4 (helper 0.4.0). Changes from version 3: new requests `password_hint`, `device_request`, `device_poll`,
 `passkey_options` and `login_passkey`; `login` takes `remember`; `unlock` takes `prf` and `credential_id`; `hello`
@@ -94,7 +95,7 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `pin_set` | `pin` (4 characters or more) | none |
 | `pin_clear` | none | none |
 | `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp, kind}` (logins only: `kind` is `"login"`); `equivalent`: the domains that the account makes equivalent to `domain` |
-| `search` | `query` (words), `limit` (0: 50; never more than 50) | `rows`: `{id, name, username, uri, has_totp, kind}`, sorted by name; `uri` is a login's first `http` or `https` address (`""` if none); see "Item kinds" |
+| `search` | `query` (words; `""`: every item), `offset` (the first match to return, 0 by default), `limit` (0: 100; never more than 500), `kinds` (`"login"`, `"card"`, `"identity"`; empty: all three) | `rows`: `{id, name, username, uri, has_totp, kind}`, the page from `offset`, sorted by name; `uri` is a login's first `http` or `https` address (`""` if none); `total`: how many items match in all; see "Item kinds" |
 | `fill` | `item` (a row id), `fields` (a list of field names, see "Fill") | one field per asked name that the item has, named the same; `totp` is the current code |
 | `save` | `item` (`""`: create a login; else the id of the login to update), `name` (on create: the site's host), `uri` (the page's address, `""` = none), `username`, `password` | `item` (the id of the created or updated login) |
 | `generate` | `kind` (`"password"` or `"passphrase"`); password: `length`, `uppercase`, `lowercase`, `numbers`, `special`, `min_numbers`, `min_special`; passphrase: `words`, `separator`, `capitalize`, `include_number` (see "Generate") | `value` (zeroed by the helper once written) |
