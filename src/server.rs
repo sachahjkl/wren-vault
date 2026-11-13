@@ -64,7 +64,10 @@ pub async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(mut input: R, mu
                         if let Op::Hello { idle_seconds, .. } = &req.op {
                             idle = (*idle_seconds > 0).then(|| Duration::from_secs(*idle_seconds));
                         }
-                        handle(&mut session, req).await
+                        let answer = handle(&mut session, req).await;
+                        // (a request may have renewed the access token: the new refresh token is kept at once)
+                        let _ = session.keep_tokens().await;
+                        answer
                     }
                     _ => (
                         Some(protocol::error(id, "bad_request", "The request is not understood.")),

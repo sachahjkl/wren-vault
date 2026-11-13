@@ -40,7 +40,7 @@ use bitwarden_generators::{
     GeneratorClientsExt, MAXIMUM_MIN_CHAR_COUNT, MAXIMUM_PASSPHRASE_NUM_WORDS, MAXIMUM_PASSWORD_LENGTH,
     MINIMUM_PASSPHRASE_NUM_WORDS, MINIMUM_PASSWORD_LENGTH, PassphraseGeneratorRequest, PasswordGeneratorRequest,
 };
-use bitwarden_sync::{SyncClientExt, SyncHandler, SyncHandlerError, SyncRequest};
+use bitwarden_sync::{SyncClientExt, SyncError, SyncHandler, SyncHandlerError, SyncRequest};
 use bitwarden_vault::{
     CardView, Cipher, CipherCreateRequest, CipherEditRequest, CipherId, CipherListView, CipherRepromptType, CipherType,
     CipherView, CipherViewType, CreateCipherError, EditCipherError, EncryptionContext, Fido2CredentialNewView,
@@ -93,6 +93,14 @@ fn cannot_reach() -> Failure {
     Failure::new(
         "network",
         "The server cannot be reached. Check its address and the network connection.",
+    )
+}
+
+/// The server refuses the session (401): log in again.
+fn session_expired() -> Failure {
+    Failure::new(
+        "session_expired",
+        "The server ended this session. Log in again with the master password.",
     )
 }
 
@@ -1396,7 +1404,29 @@ impl Session {
     /// Keeps the account: the encrypted items and the organization keys in the state, the refresh token (and the API
     /// key's secret) in the token store when they changed.
     async fn remember(&mut self, saved: &mut Saved, org_keys: Vec<(String, String)>) -> Result<(), Failure> {
-        let client = self.client.as_ref().ok_or_else(locked)?;
+        saved.org_keys = org_keys;
+        saved.equivalent_domains = self.domains.clone();
+        saved.ciphers = self
+            .ciphers
+            .iter()
+            .filter_map(|c| serde_json::to_value(c).ok())
+            .collect();
+        saved.last_sync = chrono::Utc::now().timestamp();
+        self.store
+            .save(saved)
+            .map_err(|_| Failure::new("state_write", "The Vault cannot write its state in the profile."))?;
+        self.saved = Some(saved.clone());
+        self.keep_tokens().await
+    }
+
+    /// Writes the refresh token (and the API key's secret) to the token store when the client's differ from the kept
+    /// ones. After every request (server.rs): the server gives a new refresh token at each renewal of the access token
+    /// and refuses the old one, so a renewal during a save, a passkey's counter or a sync that failed later must be kept
+    /// too, or the next unlock renews with a spent token and every request is refused (401).
+    pub async fn keep_tokens(&mut self) -> Result<(), Failure> {
+        let (Some(client), Some(saved)) = (self.client.as_ref(), self.saved.as_ref()) else {
+            return Ok(());
+        };
         let state = client.platform().state();
         let refresh_token = state
             .value::<AUTHENTICATION_TOKENS>()
@@ -1409,37 +1439,30 @@ impl Session {
             Some(UserLoginMethod::ApiKey { client_secret, .. }) => Some(client_secret),
             _ => None,
         };
+        // (nothing in the client: no login nor renewal gave a token, the kept ones stay)
+        if refresh_token.is_none() && client_secret.is_none() {
+            return Ok(());
+        }
         let secrets = Secrets {
             refresh_token,
             client_secret,
         };
-        saved.org_keys = org_keys;
-        saved.equivalent_domains = self.domains.clone();
-        saved.ciphers = self
-            .ciphers
-            .iter()
-            .filter_map(|c| serde_json::to_value(c).ok())
-            .collect();
-        saved.last_sync = chrono::Utc::now().timestamp();
-        self.store
-            .save(saved)
-            .map_err(|_| Failure::new("state_write", "The Vault cannot write its state in the profile."))?;
-        if self.secrets.as_ref() != Some(&secrets) {
-            let tokens = self.tokens.clone();
-            let account = saved.device_id.clone();
-            let copy = secrets.clone();
-            let written = blocking(move || tokens.save(&account, &copy).is_ok())
-                .await
-                .unwrap_or(false);
-            if !written {
-                return Err(Failure::new(
-                    "state_write",
-                    "The Vault cannot keep its tokens: no system store answered and the profile cannot be written.",
-                ));
-            }
-            self.secrets = Some(secrets);
+        if self.secrets.as_ref() == Some(&secrets) {
+            return Ok(());
         }
-        self.saved = Some(saved.clone());
+        let tokens = self.tokens.clone();
+        let account = saved.device_id.clone();
+        let copy = secrets.clone();
+        let written = blocking(move || tokens.save(&account, &copy).is_ok())
+            .await
+            .unwrap_or(false);
+        if !written {
+            return Err(Failure::new(
+                "state_write",
+                "The Vault cannot keep its tokens: no system store answered and the profile cannot be written.",
+            ));
+        }
+        self.secrets = Some(secrets);
         Ok(())
     }
 
@@ -1728,7 +1751,10 @@ impl Session {
         let client = self.client.as_ref().ok_or_else(locked)?;
         let rp_id = rp_id.trim();
         if rp_id.is_empty() {
-            return Err(Failure::new("bad_request", "A passkey request needs its relying party."));
+            return Err(Failure::new(
+                "bad_request",
+                "A passkey request needs its relying party.",
+            ));
         }
         // (an allow list of ids that do not decode lets no passkey through: the page named other credentials)
         let restricted = !allow.is_empty();
@@ -2537,7 +2563,15 @@ async fn sync_capture(client: &Client) -> Result<Captured, Failure> {
     })
     .await
     // (the SDK's own words: why the server or the answer failed; they hold no secret)
-    .map_err(|e| Failure::new("sync_failed", format!("The vault could not be synced with the server: {e}.")))?;
+    .map_err(|e| match &e {
+        // (the token handler could not renew the access token: the refresh token is spent or revoked, only a new login
+        // opens a session again)
+        SyncError::Api(ApiError::Response(r)) if r.status.as_u16() == 401 => session_expired(),
+        _ => Failure::new(
+            "sync_failed",
+            format!("The vault could not be synced with the server: {e}."),
+        ),
+    })?;
     let got = capture.got.lock().ok().and_then(|mut g| g.take());
     got.ok_or_else(|| Failure::new("sync_failed", "The server sent no vault."))
 }
@@ -2861,6 +2895,30 @@ mod tests {
         s
     }
 
+    /// The server refuses the session and the token cannot be renewed (no refresh token, the identity server says no):
+    /// the sync's failure asks for a new login, not an error of the SDK's words.
+    #[tokio::test]
+    async fn sync_refused_by_the_server_asks_for_a_new_login() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "invalid_grant"})))
+            .mount(&server)
+            .await;
+        let mut s = unlocked(&server).await;
+        let f = s.sync().await.expect_err("the server refuses it");
+        assert_eq!(f.code, "session_expired", "{}", f.message);
+    }
+
     fn saved_ok(r: Result<String, Failure>) -> String {
         r.unwrap_or_else(|f| panic!("{}: {}", f.code, f.message))
     }
@@ -3015,14 +3073,14 @@ mod tests {
 
     // A P-256 private key in PKCS#8 DER (the one of bitwarden-fido's own tests): every test passkey signs with it.
     const PASSKEY_KEY: &[u8] = &[
-        0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02, 0x01, 0x01, 0x04, 0x20, 0x06, 0x76,
-        0x5e, 0x85, 0xe0, 0x7f, 0xef, 0x43, 0xaa, 0x17, 0xe0, 0x7a, 0xd7, 0x85, 0x63, 0x01, 0x80, 0x70, 0x8c, 0x6c, 0x61,
-        0x43, 0x7d, 0xc3, 0xb1, 0xe6, 0xf9, 0x09, 0x24, 0xeb, 0x1f, 0xf5, 0xa1, 0x44, 0x03, 0x42, 0x00, 0x04, 0x35, 0x9a,
-        0x52, 0xf3, 0x82, 0x44, 0x66, 0x5f, 0x3f, 0xe2, 0xc4, 0x0b, 0x1c, 0x16, 0x34, 0xc5, 0x60, 0x07, 0x3a, 0x25, 0xfe,
-        0x7e, 0x7f, 0x7f, 0xda, 0xd4, 0x1c, 0x36, 0x90, 0x00, 0xee, 0xb1, 0x8e, 0x92, 0xb3, 0xac, 0x91, 0x7f, 0xb1, 0x8c,
-        0xa4, 0x85, 0xe7, 0x03, 0x07, 0xd1, 0xf5, 0x5b, 0xd3, 0x7b, 0xc3, 0x56, 0x11, 0xdf, 0xbc, 0x7a, 0x97, 0x70, 0x32,
-        0x4b, 0x3c, 0x84, 0x05, 0x71,
+        0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+        0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02, 0x01, 0x01, 0x04, 0x20,
+        0x06, 0x76, 0x5e, 0x85, 0xe0, 0x7f, 0xef, 0x43, 0xaa, 0x17, 0xe0, 0x7a, 0xd7, 0x85, 0x63, 0x01, 0x80, 0x70,
+        0x8c, 0x6c, 0x61, 0x43, 0x7d, 0xc3, 0xb1, 0xe6, 0xf9, 0x09, 0x24, 0xeb, 0x1f, 0xf5, 0xa1, 0x44, 0x03, 0x42,
+        0x00, 0x04, 0x35, 0x9a, 0x52, 0xf3, 0x82, 0x44, 0x66, 0x5f, 0x3f, 0xe2, 0xc4, 0x0b, 0x1c, 0x16, 0x34, 0xc5,
+        0x60, 0x07, 0x3a, 0x25, 0xfe, 0x7e, 0x7f, 0x7f, 0xda, 0xd4, 0x1c, 0x36, 0x90, 0x00, 0xee, 0xb1, 0x8e, 0x92,
+        0xb3, 0xac, 0x91, 0x7f, 0xb1, 0x8c, 0xa4, 0x85, 0xe7, 0x03, 0x07, 0xd1, 0xf5, 0x5b, 0xd3, 0x7b, 0xc3, 0x56,
+        0x11, 0xdf, 0xbc, 0x7a, 0x97, 0x70, 0x32, 0x4b, 0x3c, 0x84, 0x05, 0x71,
     ];
     // (`ITEM` is the id that `Echo` answers: the item whose passkey has a sign counter)
     const BETA: &str = "6faa9684-c793-4a2d-8a12-b33900187097";
@@ -3114,7 +3172,13 @@ mod tests {
         ];
         let client = s.client.clone().expect("unlocked");
         for v in views {
-            let sealed = client.vault().ciphers().encrypt(v).await.ok().expect("the user key seals the item");
+            let sealed = client
+                .vault()
+                .ciphers()
+                .encrypt(v)
+                .await
+                .ok()
+                .expect("the user key seals the item");
             s.ciphers.push(sealed.cipher);
         }
         s
@@ -3141,19 +3205,33 @@ mod tests {
         );
         let rows = s.passkeys_for("a.example", &[raw_id(BOB)]).await.unwrap_or_default();
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].item.as_str(), rows[0].credential_id.clone()), (BETA, raw_id(BOB)));
+        assert_eq!(
+            (rows[0].item.as_str(), rows[0].credential_id.clone()),
+            (BETA, raw_id(BOB))
+        );
         assert!(
-            s.passkeys_for("a.example", &[raw_id(CAROL)]).await.unwrap_or_default().is_empty(),
+            s.passkeys_for("a.example", &[raw_id(CAROL)])
+                .await
+                .unwrap_or_default()
+                .is_empty(),
             "a passkey of another site is not in the allow list's rows"
         );
-        assert!(s.passkeys_for("a.example", &["!!".to_string()]).await.unwrap_or_default().is_empty());
+        assert!(
+            s.passkeys_for("a.example", &["!!".to_string()])
+                .await
+                .unwrap_or_default()
+                .is_empty()
+        );
         let rows = s.passkeys_for("other.example", &[]).await.unwrap_or_default();
         assert_eq!(rows.len(), 1, "the second passkey of an item is found too");
         assert_eq!(rows[0].credential_id, raw_id(BOB_ELSEWHERE));
         assert!(s.passkeys_for("c.example", &[]).await.unwrap_or_default().is_empty());
         assert_eq!(s.passkeys_for("", &[]).await.err().map(|f| f.code), Some("bad_request"));
         let locked = Session::default();
-        assert_eq!(locked.passkeys_for("a.example", &[]).await.err().map(|f| f.code), Some("locked"));
+        assert_eq!(
+            locked.passkeys_for("a.example", &[]).await.err().map(|f| f.code),
+            Some("locked")
+        );
     }
 
     #[tokio::test]
@@ -3181,11 +3259,18 @@ mod tests {
         let verify = |a: &SignedAssertion, rp_id: &str| -> (u8, u32) {
             let data = identity::base64url_decode(&a.authenticator_data).unwrap();
             assert!(data.len() >= 37);
-            assert_eq!(&data[..32], Sha256::digest(rp_id.as_bytes()).as_slice(), "the rp id hash");
+            assert_eq!(
+                &data[..32],
+                Sha256::digest(rp_id.as_bytes()).as_slice(),
+                "the rp id hash"
+            );
             let signature = Signature::from_der(&identity::base64url_decode(&a.signature).unwrap()).unwrap();
             let mut signed = data.clone();
             signed.extend_from_slice(&hash);
-            assert!(key.verifying_key().verify(&signed, &signature).is_ok(), "the signature verifies");
+            assert!(
+                key.verifying_key().verify(&signed, &signature).is_ok(),
+                "the signature verifies"
+            );
             (data[32], sign_count(&data).unwrap())
         };
 
@@ -3202,7 +3287,12 @@ mod tests {
         assert_eq!(a.user_handle, identity::base64url(b"bob"));
         // the second passkey of the same item signs as itself
         let a = s
-            .passkey_assert(BETA, &raw_id(BOB_ELSEWHERE), "other.example", &identity::base64url(&hash))
+            .passkey_assert(
+                BETA,
+                &raw_id(BOB_ELSEWHERE),
+                "other.example",
+                &identity::base64url(&hash),
+            )
             .await
             .unwrap_or_else(|f| panic!("{}: {}", f.code, f.message));
         verify(&a, "other.example");

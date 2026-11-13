@@ -222,6 +222,7 @@ its own timer, and sends `keepalive` while the person is active.
 | `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
+| `session_expired` | The server refuses the session and its token cannot be renewed (401): only a new login opens one. The browser logs the account out. |
 | `no_item` | `fill` names an item that is not a login, a card or an identity of the vault; `totp` or a `save` update names one that is not a login; `passkey_assert` names a passkey that is not in the vault for that relying party. |
 | `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
 | `save_failed` | `save`: the server refused the item, or cannot be reached. The message says why. |

@@ -413,7 +413,9 @@ mod tests {
             r#"{"id":32,"op":"passkey_assert","item":"x","credential_id":"aWQ","rp_id":"a.example","client_data_hash":"aGFzaA"}"#,
         )
         .unwrap();
-        assert!(matches!(&r.op, Op::PasskeyAssert { item, credential_id, .. } if item == "x" && credential_id == "aWQ"));
+        assert!(
+            matches!(&r.op, Op::PasskeyAssert { item, credential_id, .. } if item == "x" && credential_id == "aWQ")
+        );
         assert!(
             serde_json::from_str::<Request>(r#"{"id":33,"op":"passkey_assert","item":"x","rp_id":"a.example"}"#)
                 .is_err(),
