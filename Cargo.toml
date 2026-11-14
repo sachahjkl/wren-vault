@@ -55,9 +55,11 @@ libc = "0.2.177"
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
-# Windows: the Credential Manager (DPAPI, bound to the user's account).
+# Windows: the Credential Manager (DPAPI, bound to the user's account); the time since the boot (boot.rs), the version the
+# keyring store already links.
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 # The tests check a passkey assertion as a site does: the P-256 version of bitwarden-fido, SHA-256 of the rp id.

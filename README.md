@@ -89,7 +89,8 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `hello` | `protocol` (5), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
 | `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked) with `pin` (bool: the account's PIN was kept, see "PIN"); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
 | `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email`, `pin` |
-| `unlock` | `password`, `pin`, or `prf` and `credential_id` (a passkey) | none; a `bad_pin` error carries `tries_left` |
+| `unlock` | `password`, `pin`, `prf` and `credential_id` (a passkey), or `remembered` (true: the unlock the system's keyring keeps) | none; a `bad_pin` error carries `tries_left` |
+| `remember_unlock` | `mode`: `session` (until the computer restarts), `always` (across restarts) or `never` (forget it) | none; see "Remembered unlock" |
 | `lock` | none | none; the helper then exits |
 | `logout` | `keep_pin` (bool, default false: the session ended without the person asking) | none; the helper forgets the account (state, tokens, PIN; with `keep_pin`, all but the PIN and the account's names), then exits |
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
@@ -222,6 +223,8 @@ its own timer, and sends `keepalive` while the person is active.
 | `no_state` | `pin_set` with `persist` false: the PIN's envelope would not survive the exit of the helper. |
 | `locked` | The request needs an unlocked vault. |
 | `sync_failed` | The sync failed. The vault stays unlocked with the items of the last sync. |
+| `not_remembered` | `unlock` with `remembered`, and the keyring keeps no unlock for this account (none set, kept in another boot, or a key that no longer opens: it is deleted). |
+| `no_keyring` | `remember_unlock`, and no keyring of the system answers (the key is never written to a file), or `session` on a system that does not say when it started. |
 | `session_expired` | The server refuses the session and its token cannot be renewed (401): only a new login opens one. The browser logs the account out. |
 | `no_item` | `fill` names an item that is not a login, a card or an identity of the vault; `totp` or a `save` update names one that is not a login; `passkey_assert` names a passkey that is not in the vault for that relying party. |
 | `no_totp` | `fill` with `"totp"`, or `totp`, for a login without a TOTP key, or with a key that cannot be read. |
@@ -341,6 +344,20 @@ the same `pin_check` as when the PIN was set: the envelope still opens with that
 
 A session the server refuses (`session_expired`) is no logout the person asked for: the browser sends `logout` with
 `keep_pin`, and the next login of the account has its PIN again.
+
+### Remembered unlock
+
+`remember_unlock` keeps the open vault's user key in the system's keyring (account `<device>.unlock` of the service
+`wren-vault`): a later `unlock` with `remembered` opens the vault with no password, as Bitwarden's own "never lock".
+It is the person's choice (the browser's setting, off by default): whoever can read the session's keyring can then
+open the vault.
+
+- `session`: the key is kept with the identifier of this boot of the computer (`src/boot.rs`: the kernel's boot id on
+  Linux, the minute Windows started); after a restart it no longer opens and is deleted.
+- `always`: across restarts.
+- `never`: deleted. The browser sends it for "Ask for the password at the next unlock"; after that unlock, the setting
+  keeps it again.
+- Only the keyring holds it, never a file: without a keyring that answers, `no_keyring`. A logout deletes it.
 
 ## Tests
 

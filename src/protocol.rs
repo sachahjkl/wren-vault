@@ -80,8 +80,8 @@ pub enum Op {
         client_secret: Secret,
         password: Secret,
     },
-    /// Unlock the remembered account with the master password, the PIN, or a passkey's PRF output (`prf`, with the
-    /// `credential_id` the authenticator used).
+    /// Unlock the remembered account with the master password, the PIN, a passkey's PRF output (`prf`, with the
+    /// `credential_id` the authenticator used), or the unlock the system's keyring remembers (`remembered`).
     Unlock {
         #[serde(default)]
         password: Option<Secret>,
@@ -91,7 +91,12 @@ pub enum Op {
         prf: Option<Secret>,
         #[serde(default)]
         credential_id: String,
+        #[serde(default)]
+        remembered: bool,
     },
+    /// Remember the open vault's unlock in the system's keyring (`mode`: `session` until the computer restarts,
+    /// `always`), or forget it (`never`).
+    RememberUnlock { mode: String },
     /// Lock: the helper answers, then exits.
     Lock,
     /// Forget the account here (state, tokens, PIN): the helper answers, then exits. `keep_pin`: the session ended
@@ -308,6 +313,21 @@ mod tests {
         ));
         let r: Request = serde_json::from_str(r#"{"id":12,"op":"unlock","prf":"cHJm","credential_id":"aWQ"}"#).unwrap();
         assert!(matches!(r.op, Op::Unlock { prf: Some(_), .. }));
+        let r: Request = serde_json::from_str(r#"{"id":40,"op":"unlock","remembered":true}"#).unwrap();
+        assert!(matches!(
+            r.op,
+            Op::Unlock {
+                remembered: true,
+                password: None,
+                ..
+            }
+        ));
+        let r: Request = serde_json::from_str(r#"{"id":41,"op":"remember_unlock","mode":"session"}"#).unwrap();
+        assert!(matches!(r.op, Op::RememberUnlock { ref mode } if mode == "session"));
+        let r: Request = serde_json::from_str(r#"{"id":42,"op":"logout","keep_pin":true}"#).unwrap();
+        assert!(matches!(r.op, Op::Logout { keep_pin: true }));
+        let r: Request = serde_json::from_str(r#"{"id":43,"op":"logout"}"#).unwrap();
+        assert!(matches!(r.op, Op::Logout { keep_pin: false }));
         let r: Request = serde_json::from_str(r#"{"id":13,"op":"password_hint","email":"a@b.c"}"#).unwrap();
         assert!(matches!(r.op, Op::PasswordHint { .. }));
         let r: Request = serde_json::from_str(r#"{"id":14,"op":"device_request","email":"a@b.c"}"#).unwrap();

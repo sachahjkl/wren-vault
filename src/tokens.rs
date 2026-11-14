@@ -87,6 +87,28 @@ impl Drop for Remembered {
     }
 }
 
+/// The account name of the remembered unlock in the system store (`TokenStore::save_unlock`).
+pub fn unlock_account(device: &str) -> String {
+    format!("{device}.unlock")
+}
+
+/// The user key that opens the vault without a password, which the person asked the helper to remember. Only the
+/// system's keyring holds it (never a file: there it would be the vault's key in the clear on the disk). `boot`: the
+/// identifier of the boot it was kept in, for a key kept until the computer restarts; "" for one kept across restarts.
+/// Zeroed when dropped.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct UnlockKey {
+    pub key: String,
+    #[serde(default)]
+    pub boot: String,
+}
+
+impl Drop for UnlockKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 /// A store of the system that keeps one text per account. `Err` means it did not answer or refused.
 pub trait SystemStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>, ()>;
@@ -162,6 +184,36 @@ impl TokenStore {
             return Ok(Place::Memory);
         }
         self.save_as(&remember_account(device), REMEMBER_FILE, r)
+    }
+
+    /// The remembered unlock of the account of `device`, from the system store only. Blocks.
+    pub fn load_unlock(&self, device: &str) -> Option<UnlockKey> {
+        self.dir.as_ref()?;
+        let text = Zeroizing::new(self.system()?.get(&unlock_account(device)).ok()??);
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Keeps it in the system store; false when there is none, it refuses, or nothing persists. Never a file. Blocks.
+    pub fn save_unlock(&self, device: &str, key: &UnlockKey) -> bool {
+        if self.dir.is_none() {
+            return false;
+        }
+        let Some(system) = self.system() else { return false };
+        let Ok(text) = serde_json::to_string(key) else {
+            return false;
+        };
+        let text = Zeroizing::new(text);
+        system.set(&unlock_account(device), &text).is_ok()
+    }
+
+    /// Forgets it. Blocks.
+    pub fn wipe_unlock(&self, device: &str) {
+        if self.dir.is_none() {
+            return;
+        }
+        if let Some(system) = self.system() {
+            let _ = system.delete(&unlock_account(device));
+        }
     }
 
     fn load_as<T: serde::de::DeserializeOwned>(&self, account: &str, file_name: &str) -> Option<T> {
@@ -377,6 +429,43 @@ mod tests {
             assert!(store.load_remembered("device").token_of("a@b.c").is_none());
             assert!(!dir.path().join(REMEMBER_FILE).exists());
         }
+    }
+
+    /// The remembered unlock goes to the system store only: no system store, one that refuses, or no persistence keep
+    /// nothing, and no file is ever written.
+    #[test]
+    fn the_remembered_unlock_lives_in_the_system_store_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let key = UnlockKey {
+            key: "a2V5".into(),
+            boot: "boot-1".into(),
+        };
+        let fake = Arc::new(Fake::default());
+        let up = TokenStore::with_system(Some(path.clone()), Some(fake.clone()));
+        assert!(up.save_unlock("device", &key));
+        let back = up.load_unlock("device").expect("kept");
+        assert_eq!((back.key.as_str(), back.boot.as_str()), ("a2V5", "boot-1"));
+        assert!(fake.entries.lock().unwrap().contains_key(&unlock_account("device")));
+        up.wipe("device");
+        assert!(
+            up.load_unlock("device").is_some(),
+            "the server's tokens are another entry"
+        );
+        up.wipe_unlock("device");
+        assert!(up.load_unlock("device").is_none());
+        let refusing = Arc::new(Fake {
+            down: true,
+            ..Default::default()
+        }) as Arc<dyn SystemStore>;
+        for system in [None, Some(refusing)] {
+            let store = TokenStore::with_system(Some(path.clone()), system);
+            assert!(!store.save_unlock("device", &key));
+            assert!(store.load_unlock("device").is_none());
+        }
+        let memory = TokenStore::with_system(None, Some(fake.clone()));
+        assert!(!memory.save_unlock("device", &key));
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0, "no file at all");
     }
 
     #[test]

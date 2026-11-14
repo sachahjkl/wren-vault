@@ -220,8 +220,10 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             pin,
             prf,
             credential_id,
+            remembered,
         } => {
             let result = match (&password, &pin, &prf) {
+                (None, None, None) if remembered => session.unlock_remembered().await,
                 (_, _, Some(p)) => {
                     session
                         .unlock(Unlock::Passkey {
@@ -234,7 +236,7 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
                 (Some(p), None, None) => session.unlock(Unlock::Password(p.as_str())).await,
                 (None, None, None) => Err(Failure {
                     code: "bad_request",
-                    message: "An unlock needs the master password, the PIN or a passkey.".into(),
+                    message: "An unlock needs the master password, the PIN, a passkey or the remembered unlock.".into(),
                     tries_left: None,
                 }),
             };
@@ -246,6 +248,10 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
                 Err(f) => fail(f),
             }
         }
+        Op::RememberUnlock { mode } => match session.remember_unlock(&mode).await {
+            Ok(()) => done(json!({})),
+            Err(f) => fail(f),
+        },
         Op::Lock => (Some(protocol::ok(id, json!({}))), Next::Exit),
         Op::Logout { keep_pin } => {
             session.logout(keep_pin).await;

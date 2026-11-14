@@ -55,7 +55,7 @@ use crate::{
     matching::{self, Page, Rule},
     protocol::Row,
     state::{LOGIN_API_KEY, LOGIN_PASSWORD, PIN_TRIES, STATE_VERSION, Saved, Store},
-    tokens::{Remembered, Secrets, TokenStore},
+    tokens::{Remembered, Secrets, TokenStore, UnlockKey},
 };
 
 /// A failed request: a stable code (README.md, "Errors") and a sentence for the person. Never a secret.
@@ -93,6 +93,15 @@ fn cannot_reach() -> Failure {
     Failure::new(
         "network",
         "The server cannot be reached. Check its address and the network connection.",
+    )
+}
+
+/// No unlock is remembered in the system's keyring for this account (none set, another boot, a key that no longer
+/// opens): the person unlocks with the master password, a PIN or a passkey.
+fn not_remembered() -> Failure {
+    Failure::new(
+        "not_remembered",
+        "The system's keyring holds no unlock of this vault: unlock with the master password.",
     )
 }
 
@@ -292,6 +301,8 @@ pub enum Unlock<'a> {
         prf: &'a str,
         credential_id: &'a str,
     },
+    /// The user key the system's keyring keeps for this account (`unlock_remembered`), base64.
+    Key(&'a str),
 }
 
 /// The values of one item for a fill or a copy: each asked field that the item has, by its protocol name ("totp" is
@@ -1272,6 +1283,9 @@ impl Session {
                     decrypted_user_key: key.to_string(),
                 }
             }
+            Unlock::Key(key) => InitUserCryptoMethod::DecryptedKey {
+                decrypted_user_key: key.to_string(),
+            },
         };
         let tokens = self.tokens.clone();
         let account = saved.device_id.clone();
@@ -1316,6 +1330,7 @@ impl Session {
         } else if !opened {
             return Err(match with {
                 Unlock::Passkey { .. } => prf_wrong(),
+                Unlock::Key(_) => not_remembered(),
                 _ => Failure::new("bad_password", "The master password is wrong."),
             });
         }
@@ -1380,6 +1395,89 @@ impl Session {
         Ok(())
     }
 
+    /// `unlock` with `remembered`: the user key the system's keyring keeps for this account (`remember_unlock`). One kept
+    /// for a boot that ended (mode `session`), or that no longer opens the keys, is deleted: `not_remembered`.
+    pub async fn unlock_remembered(&mut self) -> Result<(), Failure> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+        let device = self.saved.as_ref().ok_or_else(no_account)?.device_id.clone();
+        let tokens = self.tokens.clone();
+        let read = device.clone();
+        let kept = blocking(move || tokens.load_unlock(&read)).await.flatten();
+        let Some(kept) = kept else {
+            return Err(not_remembered());
+        };
+        let current = blocking(crate::boot::boot_id).await.unwrap_or_default();
+        if !kept.boot.is_empty() && kept.boot != current {
+            self.forget_unlock(&device).await;
+            return Err(not_remembered());
+        }
+        let result = self.unlock(Unlock::Key(&kept.key)).await;
+        if result.is_err() {
+            self.forget_unlock(&device).await;
+        }
+        result
+    }
+
+    /// `remember_unlock`: keeps the open vault's user key in the system's keyring, so that a later start unlocks it
+    /// without a password: `session` until the computer restarts (the boot's identifier is kept with it), `always`
+    /// across restarts, `never` deletes it. Only the system's keyring holds it, never a file: without one, `no_keyring`.
+    pub async fn remember_unlock(&mut self, mode: &str) -> Result<(), Failure> {
+        let device = self.saved.as_ref().ok_or_else(no_account)?.device_id.clone();
+        if mode == "never" {
+            self.forget_unlock(&device).await;
+            return Ok(());
+        }
+        if mode != "session" && mode != "always" {
+            return Err(Failure::new("bad_request", "The mode is never, session or always."));
+        }
+        if !self.store.persistent() {
+            return Err(Failure::new(
+                "no_state",
+                "Remembering the unlock needs a profile that keeps its data between runs.",
+            ));
+        }
+        let client = self.client.clone().ok_or_else(locked)?;
+        let key = client
+            .crypto()
+            .get_user_encryption_key()
+            .await
+            .map_err(|_| Failure::new("decrypt", "The vault's key cannot be read."))?;
+        let boot = if mode == "session" {
+            blocking(crate::boot::boot_id).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if mode == "session" && boot.is_empty() {
+            return Err(Failure::new(
+                "no_keyring",
+                "This system does not say when it started: the unlock can be remembered across restarts only.",
+            ));
+        }
+        let kept = UnlockKey {
+            key: key.to_string(),
+            boot,
+        };
+        let tokens = self.tokens.clone();
+        let saved = blocking(move || tokens.save_unlock(&device, &kept))
+            .await
+            .unwrap_or(false);
+        if !saved {
+            return Err(Failure::new(
+                "no_keyring",
+                "No keyring of the system answers: the unlock cannot be remembered.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn forget_unlock(&self, device: &str) {
+        let tokens = self.tokens.clone();
+        let device = device.to_string();
+        blocking(move || tokens.wipe_unlock(&device)).await;
+    }
+
     /// Whether the remembered account has a PIN (the answers of a login say it: a login of the same account keeps it).
     pub fn has_pin(&self) -> bool {
         self.saved.as_ref().is_some_and(Saved::has_pin)
@@ -1398,7 +1496,12 @@ impl Session {
         if let Some(old) = &old {
             let device = old.device_id.clone();
             let tokens = self.tokens.clone();
-            blocking(move || tokens.wipe(&device)).await;
+            // (the remembered unlock goes too: the account is no longer open here)
+            blocking(move || {
+                tokens.wipe(&device);
+                tokens.wipe_unlock(&device);
+            })
+            .await;
         }
         match old.filter(|o| keep_pin && o.has_pin() && !o.pin_check.is_empty()) {
             Some(o) => {
@@ -2954,12 +3057,31 @@ mod tests {
             .to_der()
             .expect("a private key has a DER form");
         let private_key: EncString = (&der).encrypt_with_key(&user_key).expect("the user key wraps it");
+        let state = WrappedAccountCryptographicState::V1 { private_key };
+        // (what `unlock` reads of the account: its private key, and unlock data whose wrapped key no test opens)
+        let wrapped: EncString = (&der).encrypt_with_key(&user_key).expect("a wrapped value");
+        let unlock = MasterPasswordUnlockData {
+            kdf: Kdf::default_pbkdf2(),
+            master_key_wrapped_user_key: wrapped,
+            salt: "user@example.com".into(),
+            contained_key_id: None,
+        };
+        let saved = Saved {
+            device_id: "device".into(),
+            user_id: USER.into(),
+            email: "user@example.com".into(),
+            identity_url: config.identity_url.clone(),
+            api_url: config.api_url.clone(),
+            master_password_unlock: to_value(&unlock).expect("serializes"),
+            account_crypto: to_value(&state).expect("serializes"),
+            ..Default::default()
+        };
         let client = new_client(&config, "device");
         let request = InitUserCryptoRequest {
             user_id: USER.parse().ok(),
             kdf_params: Kdf::default_pbkdf2(),
             email: "user@example.com".into(),
-            account_cryptographic_state: WrappedAccountCryptographicState::V1 { private_key },
+            account_cryptographic_state: state,
             method: InitUserCryptoMethod::DecryptedKey {
                 decrypted_user_key: user_key.to_base64().to_string(),
             },
@@ -2971,8 +3093,85 @@ mod tests {
         );
         set_tokens(&client, "access".into(), None, 3600).await;
         s.client = Some(client);
-        s.saved = Some(Saved::default());
+        s.saved = Some(saved);
         s
+    }
+
+    /// A system keyring in memory, for the remembered unlock.
+    #[derive(Default)]
+    struct MemoryKeyring(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+    impl crate::tokens::SystemStore for MemoryKeyring {
+        fn get(&self, account: &str) -> Result<Option<String>, ()> {
+            Ok(self.0.lock().unwrap().get(account).cloned())
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), ()> {
+            self.0.lock().unwrap().insert(account.into(), value.into());
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<(), ()> {
+            self.0.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    /// The unlock remembered in the system's keyring opens the vault after a lock, with no password; one of another
+    /// boot is refused and deleted; `never` forgets it; a profile that keeps nothing cannot remember it.
+    #[tokio::test]
+    async fn a_remembered_unlock_opens_the_vault_after_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let server = wiremock::MockServer::start().await;
+        let mut s = unlocked(&server).await;
+        assert_eq!(
+            s.remember_unlock("session").await.err().map(|f| f.code),
+            Some("no_state")
+        );
+        let keyring = Arc::new(MemoryKeyring::default());
+        s.store = Store::new(&path, true);
+        s.tokens = TokenStore::with_system(Some(dir.path().to_path_buf()), Some(keyring.clone()));
+        assert!(s.remember_unlock("always").await.is_ok());
+        assert_eq!(
+            s.remember_unlock("forever").await.err().map(|f| f.code),
+            Some("bad_request")
+        );
+        // locked: the keys go, the account stays
+        s.client = None;
+        assert!(s.unlock_remembered().await.is_ok(), "opened from the keyring");
+        assert!(s.unlocked());
+        // kept for a boot that ended: refused, and gone
+        assert!(s.remember_unlock("session").await.is_ok());
+        let account = crate::tokens::unlock_account("device");
+        let entry = keyring.0.lock().unwrap().get(&account).cloned().expect("kept");
+        let other_boot = entry.replace(&crate::boot::boot_id(), "another-boot");
+        keyring.0.lock().unwrap().insert(account.clone(), other_boot);
+        s.client = None;
+        assert_eq!(
+            s.unlock_remembered().await.err().map(|f| f.code),
+            Some("not_remembered")
+        );
+        assert!(!keyring.0.lock().unwrap().contains_key(&account));
+        // never: forgotten
+        s.unlock(Unlock::Key(&{
+            let k = entry.clone();
+            let v: UnlockKey = serde_json::from_str(&k).unwrap();
+            v.key.clone()
+        }))
+        .await
+        .expect("the key opens");
+        assert!(s.remember_unlock("always").await.is_ok());
+        assert!(s.remember_unlock("never").await.is_ok());
+        s.client = None;
+        assert_eq!(
+            s.unlock_remembered().await.err().map(|f| f.code),
+            Some("not_remembered")
+        );
+        // nothing of it in the profile's files
+        for f in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+            let v: UnlockKey = serde_json::from_str(&entry).unwrap();
+            assert!(!text.contains(&v.key), "the key is in {:?}", f.path());
+        }
     }
 
     /// The server refuses the session and the token cannot be renewed (no refresh token, the identity server says no):
