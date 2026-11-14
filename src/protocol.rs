@@ -94,8 +94,12 @@ pub enum Op {
     },
     /// Lock: the helper answers, then exits.
     Lock,
-    /// Forget the account here (state, tokens, PIN): the helper answers, then exits.
-    Logout,
+    /// Forget the account here (state, tokens, PIN): the helper answers, then exits. `keep_pin`: the session ended
+    /// without the person asking (the server refused it): the PIN stays for the next login of the same account.
+    Logout {
+        #[serde(default)]
+        keep_pin: bool,
+    },
     /// Get the vault from the server again.
     Sync,
     /// Set the PIN that unlocks this account on this machine.

@@ -482,10 +482,11 @@ impl Session {
         }
         self.store = Store::new(state_dir, persist);
         self.tokens = TokenStore::new(self.store.dir());
+        // (a state kept after a session the server ended holds only the PIN for the next login: no account to unlock)
         let saved = self
             .store
             .load()
-            .filter(|s| s.identity_url == config.identity_url && s.api_url == config.api_url);
+            .filter(|s| s.identity_url == config.identity_url && s.api_url == config.api_url && !s.logged_out);
         self.config = Some(config);
         self.saved = saved;
         Ok(match &self.saved {
@@ -1190,13 +1191,18 @@ impl Session {
         };
         let _ = state.value::<USER_LOGIN_METHOD>().set(method).await;
         init_organizations(&client, &captured.org_keys).await;
+        let old = self.store.load().or_else(|| self.saved.clone());
+        // the PIN of this same account stays, when the new login opened the user key it seals
+        let check = pin_check_of(&client).await;
+        let kept_pin = pin_kept(old.as_ref(), &config.identity_url, &user_id, check.as_deref());
         // a former account of this state (another server, another login) leaves its secrets behind it
-        if let Some(old) = self.store.load().or_else(|| self.saved.clone())
+        if let Some(old) = old
             && old.device_id != device_id
         {
             let tokens = self.tokens.clone();
             blocking(move || tokens.wipe(&old.device_id)).await;
         }
+        let (pin_envelope, pin_check) = kept_pin.unwrap_or((Value::Null, String::new()));
         let mut saved = Saved {
             version: STATE_VERSION,
             email: email.clone(),
@@ -1209,6 +1215,8 @@ impl Session {
             master_password_unlock: to_value(&unlock)?,
             account_crypto: to_value(&account_crypto)?,
             prf_options: prf_options_value(&captured.crypto)?,
+            pin_envelope,
+            pin_check,
             ..Default::default()
         };
         self.secrets = None;
@@ -1311,6 +1319,14 @@ impl Session {
                 _ => Failure::new("bad_password", "The master password is wrong."),
             });
         }
+        // (a PIN set before the check existed gets it at its first unlock: a later login of the account keeps it too)
+        if saved.has_pin()
+            && saved.pin_check.is_empty()
+            && let Some(check) = pin_check_of(&client).await
+        {
+            saved.pin_check = check;
+            let _ = self.store.save(&saved);
+        }
         init_organizations(&client, &saved.org_keys).await;
         self.ciphers = saved
             .ciphers
@@ -1325,8 +1341,8 @@ impl Session {
     }
 
     /// `pin_set`: a PIN that unlocks this account on this machine. The SDK seals the user key with it.
-    pub fn pin_set(&mut self, pin: &str) -> Result<(), Failure> {
-        let client = self.client.as_ref().ok_or_else(locked)?;
+    pub async fn pin_set(&mut self, pin: &str) -> Result<(), Failure> {
+        let client = self.client.clone().ok_or_else(locked)?;
         if !self.store.persistent() {
             return Err(Failure::new(
                 "no_state",
@@ -1343,6 +1359,7 @@ impl Session {
             .map_err(|_| Failure::new("decrypt", "The PIN cannot be set."))?;
         saved.pin_envelope = to_value(&enrolled.pin_protected_user_key_envelope)?;
         saved.pin_failures = 0;
+        saved.pin_check = pin_check_of(&client).await.unwrap_or_default();
         self.store
             .save(&saved)
             .map_err(|_| Failure::new("state_write", "The Vault cannot write its state in the profile."))?;
@@ -1355,6 +1372,7 @@ impl Session {
         let mut saved = self.saved.clone().ok_or_else(no_account)?;
         saved.pin_envelope = Value::Null;
         saved.pin_failures = 0;
+        saved.pin_check.clear();
         self.store
             .save(&saved)
             .map_err(|_| Failure::new("state_write", "The Vault cannot write its state in the profile."))?;
@@ -1362,18 +1380,47 @@ impl Session {
         Ok(())
     }
 
-    /// `logout`: the state, the secrets in the system store and the PIN go. The caller exits after.
-    pub async fn logout(&mut self) {
+    /// Whether the remembered account has a PIN (the answers of a login say it: a login of the same account keeps it).
+    pub fn has_pin(&self) -> bool {
+        self.saved.as_ref().is_some_and(Saved::has_pin)
+    }
+
+    /// `logout`: the state, the secrets in the system store and the PIN go. The caller exits after. `keep_pin`: the
+    /// session ended without the person asking (the server refused it): the account's names and its PIN stay on disk,
+    /// nothing else, for the next login of the same account (`pin_kept`).
+    pub async fn logout(&mut self, keep_pin: bool) {
         self.forget_waiting();
         self.client = None;
         self.ciphers.clear();
         self.domains.clear();
         self.secrets = None;
-        if let Some(old) = self.saved.take().or_else(|| self.store.load()) {
+        let old = self.saved.take().or_else(|| self.store.load());
+        if let Some(old) = &old {
+            let device = old.device_id.clone();
             let tokens = self.tokens.clone();
-            blocking(move || tokens.wipe(&old.device_id)).await;
+            blocking(move || tokens.wipe(&device)).await;
         }
-        self.store.wipe();
+        match old.filter(|o| keep_pin && o.has_pin() && !o.pin_check.is_empty()) {
+            Some(o) => {
+                let kept = Saved {
+                    version: STATE_VERSION,
+                    email: o.email,
+                    identity_url: o.identity_url,
+                    api_url: o.api_url,
+                    device_id: o.device_id,
+                    user_id: o.user_id,
+                    login: o.login,
+                    pin_envelope: o.pin_envelope,
+                    pin_check: o.pin_check,
+                    logged_out: true,
+                    ..Default::default()
+                };
+                if self.store.save(&kept).is_err() {
+                    self.store.wipe();
+                }
+            }
+            None => self.store.wipe(),
+        }
     }
 
     /// `sync`: the vault from the server. Returns the item count and the time of the sync (Unix seconds).
@@ -2300,12 +2347,45 @@ pub fn totp_at(key: &str, at: chrono::DateTime<chrono::Utc>) -> Result<Code, Fai
     })
 }
 
+/// The check of the client's user key: HMAC-SHA-256 of a fixed text under the key, in hex. It tells whether a later
+/// login opened the same user key as the one a PIN's envelope seals (a key rotation in the web vault makes another),
+/// and says nothing of the key: finding it from the check is as hard as breaking HMAC under a 256-bit key. `None`:
+/// the client has no user key.
+async fn pin_check_of(client: &Client) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    let key = Zeroizing::new(client.crypto().get_user_encryption_key().await.ok()?.into_bytes());
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).ok()?;
+    mac.update(b"wren-vault: the user key a PIN seals");
+    let out = mac.finalize().into_bytes();
+    Some(out.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The PIN of `old` that a new login of the account `user_id` on `identity_url` keeps, with its check: when it is the
+/// same account on the same server and its user key gives the same `check` (not rotated since the PIN was set). The
+/// envelope still opens with that PIN then; the person does not set it again after a login.
+pub fn pin_kept(
+    old: Option<&Saved>,
+    identity_url: &str,
+    user_id: &str,
+    check: Option<&str>,
+) -> Option<(Value, String)> {
+    let old = old?;
+    let same = !user_id.is_empty()
+        && old.user_id == user_id
+        && old.identity_url == identity_url
+        && old.has_pin()
+        && !old.pin_check.is_empty()
+        && check == Some(old.pin_check.as_str());
+    same.then(|| (old.pin_envelope.clone(), old.pin_check.clone()))
+}
+
 /// A wrong PIN: counted in the state; at `PIN_TRIES` the envelope goes and only the master password unlocks.
 pub fn count_wrong_pin(saved: &mut Saved) -> Failure {
     saved.pin_failures += 1;
     if saved.pin_failures >= PIN_TRIES {
         saved.pin_envelope = Value::Null;
         saved.pin_failures = 0;
+        saved.pin_check.clear();
         return Failure::new(
             "pin_reset",
             "Too many wrong PINs: the PIN was removed. Unlock with the master password.",
@@ -3351,6 +3431,117 @@ mod tests {
         assert_eq!(f.code, "pin_reset");
         assert!(!saved.has_pin());
         assert_eq!(saved.pin_failures, 0);
+    }
+
+    /// A new login keeps the PIN of the same account on the same server whose user key was not rotated, and only then.
+    #[test]
+    fn a_login_keeps_the_pin_of_the_same_account_and_key() {
+        let old = Saved {
+            identity_url: "https://identity.example".into(),
+            user_id: "u1".into(),
+            pin_envelope: Value::String("sealed".into()),
+            pin_check: "c1".into(),
+            ..Default::default()
+        };
+        let kept = pin_kept(Some(&old), "https://identity.example", "u1", Some("c1"));
+        assert_eq!(kept, Some((Value::String("sealed".into()), "c1".to_string())));
+        assert_eq!(
+            pin_kept(Some(&old), "https://identity.example", "u1", Some("c2")),
+            None,
+            "the key was rotated"
+        );
+        assert_eq!(
+            pin_kept(Some(&old), "https://identity.example", "u2", Some("c1")),
+            None,
+            "another account"
+        );
+        assert_eq!(
+            pin_kept(Some(&old), "https://other.example", "u1", Some("c1")),
+            None,
+            "another server"
+        );
+        assert_eq!(
+            pin_kept(Some(&old), "https://identity.example", "", Some("c1")),
+            None,
+            "an account not known"
+        );
+        assert_eq!(
+            pin_kept(Some(&old), "https://identity.example", "u1", None),
+            None,
+            "no user key"
+        );
+        assert_eq!(pin_kept(None, "https://identity.example", "u1", Some("c1")), None);
+        let unchecked = Saved {
+            pin_check: String::new(),
+            ..old.clone()
+        };
+        assert_eq!(
+            pin_kept(Some(&unchecked), "https://identity.example", "u1", Some("")),
+            None,
+            "a PIN set before the check"
+        );
+    }
+
+    /// The check of a user key is the same for one key and differs for another.
+    #[tokio::test]
+    async fn the_pin_check_names_the_user_key() {
+        let server = wiremock::MockServer::start().await;
+        let a = unlocked(&server).await;
+        let b = unlocked(&server).await;
+        let ca = pin_check_of(a.client.as_ref().unwrap()).await.expect("a user key");
+        assert_eq!(
+            pin_check_of(a.client.as_ref().unwrap()).await.as_deref(),
+            Some(ca.as_str())
+        );
+        assert_eq!(ca.len(), 64);
+        assert_ne!(pin_check_of(b.client.as_ref().unwrap()).await, Some(ca));
+    }
+
+    /// A session the server ended keeps the PIN and the account's names on disk, nothing else, and no account unlocks
+    /// from them; a logout the person asked for leaves nothing.
+    #[tokio::test]
+    async fn a_logout_keeps_the_pin_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let full = Saved {
+            version: STATE_VERSION,
+            email: "a@b.c".into(),
+            identity_url: "https://identity.example".into(),
+            api_url: "https://api.example".into(),
+            device_id: "dev".into(),
+            user_id: "u1".into(),
+            master_password_unlock: Value::String("unlock".into()),
+            ciphers: vec![Value::String("item".into())],
+            pin_envelope: Value::String("sealed".into()),
+            pin_check: "c1".into(),
+            ..Default::default()
+        };
+        for keep in [true, false] {
+            let mut s = Session::default();
+            s.store = Store::new(&path, true);
+            s.tokens = TokenStore::new(None);
+            s.store.save(&full).unwrap();
+            s.saved = Some(full.clone());
+            s.logout(keep).await;
+            let left = s.store.load();
+            if keep {
+                let left = left.expect("the PIN stays");
+                assert!(left.logged_out && left.has_pin());
+                assert_eq!((left.user_id.as_str(), left.pin_check.as_str()), ("u1", "c1"));
+                assert!(left.ciphers.is_empty() && left.master_password_unlock.is_null());
+                let config = Config {
+                    identity_url: "https://identity.example".into(),
+                    api_url: "https://api.example".into(),
+                    client_version: "test".into(),
+                    device_name: String::new(),
+                };
+                let mut again = Session::default();
+                let account = again.hello(config, &path, true).ok().expect("hello");
+                assert_eq!(account.state, "none", "no account unlocks from it");
+            } else {
+                assert!(left.is_none(), "a logout asked for leaves nothing");
+            }
+        }
     }
 
     #[test]

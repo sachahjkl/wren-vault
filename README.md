@@ -87,11 +87,11 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | op | Request fields | Answer fields |
 |---|---|---|
 | `hello` | `protocol` (5), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
-| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
-| `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email` |
+| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked) with `pin` (bool: the account's PIN was kept, see "PIN"); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
+| `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email`, `pin` |
 | `unlock` | `password`, `pin`, or `prf` and `credential_id` (a passkey) | none; a `bad_pin` error carries `tries_left` |
 | `lock` | none | none; the helper then exits |
-| `logout` | none | none; the helper forgets the account (state, tokens, PIN), then exits |
+| `logout` | `keep_pin` (bool, default false: the session ended without the person asking) | none; the helper forgets the account (state, tokens, PIN; with `keep_pin`, all but the PIN and the account's names), then exits |
 | `sync` | none | `items` (count), `last_sync` (Unix seconds) |
 | `pin_set` | `pin` (4 characters or more) | none |
 | `pin_clear` | none | none |
@@ -303,6 +303,8 @@ written: the account is forgotten when the helper exits. Version 2 of the file; 
 | `org_keys` | Organization keys, encrypted for the account. |
 | `ciphers` | The items as the server sends them, encrypted. |
 | `pin_envelope`, `pin_failures` | The user key sealed by the PIN (the SDK's PIN envelope), and the wrong PINs since the last good one. |
+| `pin_check` | HMAC-SHA-256 of a fixed text under the user key the PIN seals: a later login of the account keeps the PIN when its key gives the same check. It says nothing of the key. |
+| `logged_out` | The session ended without the person asking: only the account's names and the PIN remain, no account unlocks. |
 | `last_sync` | Time of the last sync. |
 | `equivalent_domains` | The groups of equivalent domains of the last sync (public). |
 
@@ -327,7 +329,18 @@ A stolen refresh token gives access to the encrypted items on the server, not to
 
 `pin_set` seals the user key with the PIN (the SDK's PIN envelope, a password-based key derivation) and keeps the
 envelope in the state. A PIN is weaker than the master password: the helper counts wrong PINs in the state, and the
-fifth one in a row deletes the envelope (`pin_reset`). A new login starts without a PIN.
+fifth one in a row deletes the envelope (`pin_reset`).
+
+The PIN is never stored, nor put in the system store: anyone with the session would then open the vault, and the PIN
+would protect nothing. A new login keeps the PIN when it is the same account on the same server, and its user key gives
+the same `pin_check` as when the PIN was set: the envelope still opens with that PIN. These remove the PIN:
+
+- a `logout` the person asks for (`keep_pin` false);
+- a login of another account, or on another server;
+- a user key changed in the web vault (a key rotation): the check differs.
+
+A session the server refuses (`session_expired`) is no logout the person asked for: the browser sends `logout` with
+`keep_pin`, and the next login of the account has its PIN again.
 
 ## Tests
 

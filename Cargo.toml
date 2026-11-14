@@ -35,6 +35,9 @@ bitwarden-sync = { git = "https://github.com/bitwarden/sdk-internal", rev = "300
 bitwarden-vault = { git = "https://github.com/bitwarden/sdk-internal", rev = "300aea5933ef3bc139e430575b6868b9a9b1d4a7" }
 async-trait = "0.1.89"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+# The PIN's check of the user key (sdk.rs, pin_check_of): HMAC-SHA-256, the versions the SDK already links.
+hmac = "0.12.1"
+sha2 = "0.10.9"
 # The system store of the tokens (README.md, "State on disk"): keyring-core's API, one store per system below.
 keyring-core = "1.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -59,7 +62,6 @@ windows-native-keyring-store = { version = "1.1.0", default-features = false }
 [dev-dependencies]
 # The tests check a passkey assertion as a site does: the P-256 version of bitwarden-fido, SHA-256 of the rp id.
 p256 = "0.13.2"
-sha2 = "0.10.9"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["test-util"] }
 wiremock = "0.6.5"

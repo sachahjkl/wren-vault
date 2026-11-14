@@ -60,6 +60,14 @@ pub struct Saved {
     /// Wrong PINs since the last good one. At `PIN_TRIES` the envelope is deleted.
     #[serde(default)]
     pub pin_failures: u32,
+    /// The check of the user key the PIN's envelope seals (sdk.rs, `pin_check_of`): a new login of the account keeps
+    /// the PIN when its user key gives the same check (the key was not rotated). "" when no PIN is set.
+    #[serde(default)]
+    pub pin_check: String,
+    /// The session ended without the person logging out (the server refused it): only the account's names and its PIN
+    /// are kept, for the next login of the same account. Not an account that unlocks: `hello` says none.
+    #[serde(default)]
+    pub logged_out: bool,
     /// The account's passkeys that can unlock it, as the last sync gave them (the SDK's PRF unlock options: the
     /// credential's id and transports, its private key wrapped by its PRF key, the user key encapsulated to it); null
     /// or empty when none. Nothing in them opens the vault without the authenticator.

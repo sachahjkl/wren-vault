@@ -4744,6 +4744,7 @@ dependencies = [
  "bitwarden-vault",
  "chrono",
  "dbus-secret-service-keyring-store",
+ "hmac 0.12.1",
  "keyring-core",
  "libc",
  "p256 0.13.2",
