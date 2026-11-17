@@ -1,0 +1,154 @@
+name: Release
+
+# A version tag vX.Y.Z (annotated: git tag -a vX.Y.Z -m "wren-vault X.Y.Z") builds the program for Windows x64 and Linux x64,
+# signs their manifests and publishes the release (README.md, "Releases"). Before the tag, `wrentool vault prepare X.Y.Z` (in a
+# checkout of Wren beside this one) assembled CHANGELOG.md from changelog.d and wrote the version in Cargo.toml and Cargo.lock.
+# The tool is Wren's (sachahjkl/wren, src/tools/wrentool): it signs in the format of the toolkit's update package, which Wren
+# reads when it pins a release (Wren's src/md/features/vault-helper-delivery.md). None of its code goes into this program.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: 1.99.1
+  ODIN_TAG: dev-2026-11a
+  ODIN_SHA256: 65c9f6e97d6f8a30930e151f270ce5aeaa98fe8b2ba49fe067394e2af04f7618
+
+jobs:
+  # The tag says the version of Cargo.toml, and CHANGELOG.md has its section with no fragment left.
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wren-vault
+      - uses: actions/checkout@v4
+        with:
+          repository: sachahjkl/wren
+          path: wren
+      - name: wrentool (Wren's tool, Odin dev-2026-11a)
+        run: |
+          git -C wren submodule update --init --depth 1 ext/gui_toolkit
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$RUNNER_TEMP/odin.tar.gz" "https://github.com/odin-lang/Odin/releases/download/$ODIN_TAG/odin-linux-amd64-$ODIN_TAG.tar.gz"
+          echo "$ODIN_SHA256  $RUNNER_TEMP/odin.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/odin" && tar -xzf "$RUNNER_TEMP/odin.tar.gz" -C "$RUNNER_TEMP/odin"
+          odin="$(find "$RUNNER_TEMP/odin" -maxdepth 2 -name odin -type f | head -1)"
+          mkdir -p wren/build
+          (cd wren && "$odin" build src/tools/wrentool -collection:wb=src -collection:toolkit=ext/gui_toolkit/src -out:build/wrentool)
+      - name: Check the version and the changelog
+        id: version
+        env:
+          WREN_VAULT_SOURCE: ${{ github.workspace }}/wren-vault
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          wren/build/wrentool vault check-release "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: check
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE) { exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/wren-vault.exe "dist/wren-vault-${{ needs.check.outputs.version }}-windows-x64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wren-vault-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # In Debian 12: its glibc 2.36 is the oldest a Linux build of Wren needs, so the program starts wherever Wren does.
+  linux:
+    needs: check
+    runs-on: ubuntu-24.04
+    container: debian:bookworm
+    timeout-minutes: 60
+    steps:
+      - name: Debian's packages
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git ca-certificates curl build-essential pkg-config libdbus-1-dev >/dev/null
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          export RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"; echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain "$RUST_VERSION"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+          cp target/release/wren-vault "dist/wren-vault-${{ needs.check.outputs.version }}-linux-x64"
+          ldd "dist/wren-vault-${{ needs.check.outputs.version }}-linux-x64"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wren-vault-linux-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The manifests are signed with the repository's secret WREN_VAULT_SIGNING_KEY; wrentool refuses a key that is not the one
+  # built into Wren (src/vault/pin/pin.odin), so a release no Wren could pin is never published.
+  publish:
+    needs: [check, windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wren-vault
+      - uses: actions/checkout@v4
+        with:
+          repository: sachahjkl/wren
+          path: wren
+      - name: wrentool (Wren's tool, Odin dev-2026-11a)
+        run: |
+          git -C wren submodule update --init --depth 1 ext/gui_toolkit
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$RUNNER_TEMP/odin.tar.gz" "https://github.com/odin-lang/Odin/releases/download/$ODIN_TAG/odin-linux-amd64-$ODIN_TAG.tar.gz"
+          echo "$ODIN_SHA256  $RUNNER_TEMP/odin.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/odin" && tar -xzf "$RUNNER_TEMP/odin.tar.gz" -C "$RUNNER_TEMP/odin"
+          odin="$(find "$RUNNER_TEMP/odin" -maxdepth 2 -name odin -type f | head -1)"
+          mkdir -p wren/build
+          (cd wren && "$odin" build src/tools/wrentool -collection:wb=src -collection:toolkit=ext/gui_toolkit/src -out:build/wrentool)
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wren-vault-*-x64
+          path: dist
+          merge-multiple: true
+      - name: Sign the manifests
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.WREN_VAULT_SIGNING_KEY }}
+        run: |
+          chmod +x dist/*-linux-x64
+          wren/build/wrentool vault sign -Dir "$GITHUB_WORKSPACE/dist" -Version "${{ needs.check.outputs.version }}"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          wren/build/wrentool changelog -Section -Version "$v" -Root "$GITHUB_WORKSPACE/wren-vault" -Out "$GITHUB_WORKSPACE/NOTES.md"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "wren-vault $v" --notes-file NOTES.md --verify-tag --repo "$GITHUB_REPOSITORY"

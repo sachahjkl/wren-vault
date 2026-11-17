@@ -38,6 +38,39 @@ yet, `wrentool build vault` makes it once; commit it.
 On Linux the build links libdbus (the Secret Service store of the tokens): `pkg-config` and the `dbus` development
 files must be present (the Nix flake provides them).
 
+## Releases
+
+A release is a tag `vX.Y.Z` of this repository. Its source is the tag itself (GitHub's source archives of the release).
+The automation is the command `wrentool vault` of Wren's tool (`src/tools/wrentool` in `sachahjkl/wren`, a checkout
+beside this one): it signs in the format of the update manifests of Wren's toolkit, which Wren reads when it pins a
+release. It is a build tool: none of its code goes into this program. The design is Wren's
+`src/md/features/vault-helper-delivery.md`.
+
+1. In the Wren checkout: `wrentool vault prepare X.Y.Z`. It assembles `changelog.d/` into `CHANGELOG.md` and writes
+   the version in `Cargo.toml` and `Cargo.lock` of this checkout (`WREN_VAULT_SOURCE` names another one).
+2. Here: commit, `git tag -a vX.Y.Z -m "wren-vault X.Y.Z"`, push the branch and the tag.
+3. `.github/workflows/release.yml` checks the tag against `Cargo.toml` and `CHANGELOG.md`
+   (`wrentool vault check-release`), runs `cargo test --locked` and `cargo build --release --locked` on Windows
+   (`windows-2025`) and on Linux (`debian:bookworm`, glibc 2.36), signs the manifests (`wrentool vault sign`) and
+   publishes the release with the section of `CHANGELOG.md` as its notes.
+4. In the Wren checkout: `wrentool vault pin X.Y.Z` checks the signed manifests and writes `vault.version`, the
+   release that Wren then runs and ships.
+
+What a release publishes:
+
+| File | What it is |
+|---|---|
+| `wren-vault-X.Y.Z-windows-x64.exe`, `wren-vault-X.Y.Z-linux-x64` | the program |
+| `update-windows-x64.json`, `update-linux-x64.json` | the manifest of each program: product `wren-vault`, version, platform, file name, size, SHA-256, date |
+| the same names + `.sig` | the Ed25519 signature (base64url) of `wren-vault-update-v1\n` followed by the manifest's bytes |
+| `SHA256SUMS.txt` | the SHA-256 of the programs |
+
+The signing key is wren-vault's own, not Wren's. Its private half is the secret `WREN_VAULT_SIGNING_KEY` of this
+repository; its public half is built into Wren (`src/vault/pin/pin.odin`). `wrentool vault sign` refuses another key.
+
+To check a program by hand: `sha256sum -c SHA256SUMS.txt`, or `wrentool vault pin X.Y.Z` in a Wren checkout, which
+checks the signatures.
+
 ## Protocol
 
 Version 5 (this helper 0.5.0). Changes from version 4: `hello` takes and answers `protocol` 5; new requests `save`
