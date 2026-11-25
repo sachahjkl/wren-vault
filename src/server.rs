@@ -153,7 +153,9 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             drop(password);
             drop(code);
             match result {
-                Ok(LoginOutcome::Done) => done(json!({ "result": "ok", "pin": session.has_pin() })),
+                Ok(LoginOutcome::Done) => done(json!({
+                    "result": "ok", "pin": session.has_pin(), "passkey": session.has_passkey(),
+                })),
                 Ok(LoginOutcome::NeedTwoFactor { providers, email_sent }) => done(json!({
                     "result": "need_two_factor", "providers": providers, "email_sent": email_sent,
                 })),
@@ -172,7 +174,9 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             drop(client_secret);
             drop(password);
             match result {
-                Ok(email) => done(json!({ "result": "ok", "email": email, "pin": session.has_pin() })),
+                Ok(email) => done(json!({
+                    "result": "ok", "email": email, "pin": session.has_pin(), "passkey": session.has_passkey(),
+                })),
                 Err(f) => fail(f),
             }
         }
@@ -186,7 +190,9 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
         },
         Op::DevicePoll => match session.device_poll().await {
             Ok(DevicePoll::Pending) => done(json!({ "result": "pending" })),
-            Ok(DevicePoll::Done(email)) => done(json!({ "result": "ok", "email": email, "pin": session.has_pin() })),
+            Ok(DevicePoll::Done(email)) => done(json!({
+                "result": "ok", "email": email, "pin": session.has_pin(), "passkey": session.has_passkey(),
+            })),
             Err(f) => fail(f),
         },
         Op::PasskeyOptions { purpose, rp_id } => match session.passkey_options(&purpose, &rp_id).await {
@@ -211,7 +217,9 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             let result = session.login_passkey(&assertion, prf.as_str()).await;
             drop(prf);
             match result {
-                Ok(email) => done(json!({ "result": "ok", "email": email, "pin": session.has_pin() })),
+                Ok(email) => done(json!({
+                    "result": "ok", "email": email, "pin": session.has_pin(), "passkey": session.has_passkey(),
+                })),
                 Err(f) => fail(f),
             }
         }
@@ -258,7 +266,9 @@ async fn handle(session: &mut Session, req: Request) -> (Option<Value>, Next) {
             (Some(protocol::ok(id, json!({}))), Next::Exit)
         }
         Op::Sync => match session.sync().await {
-            Ok((items, last_sync)) => done(json!({ "items": items, "last_sync": last_sync })),
+            Ok((items, last_sync)) => done(json!({
+                "items": items, "last_sync": last_sync, "passkey": session.has_passkey(),
+            })),
             Err(f) => fail(f),
         },
         Op::PinSet { pin } => {

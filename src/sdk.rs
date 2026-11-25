@@ -1304,9 +1304,6 @@ impl Session {
                 expires_on: 0,
             })
             .await;
-        if let Some(method) = login_method(&saved, &unlock.kdf, &secrets) {
-            let _ = state.value::<USER_LOGIN_METHOD>().set(method).await;
-        }
         let request = InitUserCryptoRequest {
             user_id: saved.user_id.parse().ok(),
             kdf_params: unlock.kdf.clone(),
@@ -1333,6 +1330,11 @@ impl Session {
                 Unlock::Key(_) => not_remembered(),
                 _ => Failure::new("bad_password", "The master password is wrong."),
             });
+        }
+        // Set after `initialize_user_crypto`: the SDK resets `USER_LOGIN_METHOD` to an empty `client_id` there,
+        // which breaks refresh-token and API-key renewal on the sync that follows.
+        if let Some(method) = login_method(&saved, &unlock.kdf, &secrets) {
+            let _ = state.value::<USER_LOGIN_METHOD>().set(method).await;
         }
         // (a PIN set before the check existed gets it at its first unlock: a later login of the account keeps it too)
         if saved.has_pin()
@@ -1481,6 +1483,11 @@ impl Session {
     /// Whether the remembered account has a PIN (the answers of a login say it: a login of the same account keeps it).
     pub fn has_pin(&self) -> bool {
         self.saved.as_ref().is_some_and(Saved::has_pin)
+    }
+
+    /// Whether a passkey of the remembered account unlocks it (the answers of login and sync say it).
+    pub fn has_passkey(&self) -> bool {
+        self.saved.as_ref().is_some_and(|s| !prf_options_of(s).is_empty())
     }
 
     /// `logout`: the state, the secrets in the system store and the PIN go. The caller exits after. `keep_pin`: the
@@ -3766,5 +3773,167 @@ mod tests {
             login_method(&saved, &kdf, &secrets),
             Some(UserLoginMethod::ApiKey { .. })
         ));
+    }
+
+    fn empty_sync_body() -> Value {
+        serde_json::json!({
+            "object": "sync",
+            "profile": {
+                "id": USER,
+                "email": "user@example.com",
+                "organizations": []
+            },
+            "ciphers": []
+        })
+    }
+
+    /// Unlocking with a PIN must keep `USER_LOGIN_METHOD` (`client_id=web`) after `initialize_user_crypto`, so the
+    /// immediate `sync` renews the access token instead of failing with `session_expired`.
+    #[tokio::test]
+    async fn pin_unlock_renews_the_session_with_the_client_id() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_string_contains, header, method, path},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = dir.path().to_str().unwrap().to_string();
+        let server = MockServer::start().await;
+        let mut s = unlocked(&server).await;
+        s.store = Store::new(&path_str, true);
+        s.tokens = TokenStore::with_system(Some(dir.path().to_path_buf()), None);
+        s.tokens
+            .save(
+                "device",
+                &Secrets {
+                    refresh_token: Some("old-refresh".into()),
+                    client_secret: None,
+                },
+            )
+            .unwrap();
+        s.pin_set("1234").await.expect("PIN sets");
+        // lock: keys and cached secrets go, saved account and PIN envelope stay
+        s.client = None;
+        s.secrets = None;
+
+        let wrong = s.unlock(Unlock::Pin("0000")).await.expect_err("wrong PIN fails");
+        assert_eq!(wrong.code, "bad_pin");
+        assert_eq!(wrong.tries_left, Some(PIN_TRIES - 1));
+        assert!(!s.unlocked());
+
+        s.unlock(Unlock::Pin("1234")).await.expect("PIN unlocks");
+        assert!(s.unlocked());
+        assert_eq!(s.saved.as_ref().map(|v| v.pin_failures), Some(0));
+
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .and(body_string_contains("client_id=web"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": "api"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .and(header("authorization", "Bearer fresh-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_sync_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (items, _) = s.sync().await.expect("sync renews the session");
+        assert_eq!(items, 0);
+        s.keep_tokens().await.unwrap();
+        assert!(s.unlocked());
+        assert_eq!(
+            s.tokens.load("device").and_then(|t| t.refresh_token.clone()).as_deref(),
+            Some("new-refresh")
+        );
+    }
+
+    /// Unlocking an API-key account with a PIN must preserve `UserLoginMethod::ApiKey` after `initialize_user_crypto`,
+    /// so `sync` renews via `client_credentials` and `keep_tokens` keeps `client_secret`.
+    #[tokio::test]
+    async fn api_key_unlock_preserves_api_key_login_method() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_string_contains, header, method, path},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = dir.path().to_str().unwrap().to_string();
+        let server = MockServer::start().await;
+        let mut s = unlocked(&server).await;
+        s.store = Store::new(&path_str, true);
+        s.tokens = TokenStore::with_system(Some(dir.path().to_path_buf()), None);
+        if let Some(saved) = s.saved.as_mut() {
+            saved.login = LOGIN_API_KEY.into();
+            saved.api_client_id = "user.1234".into();
+        }
+        s.tokens
+            .save(
+                "device",
+                &Secrets {
+                    refresh_token: None,
+                    client_secret: Some("api-secret".into()),
+                },
+            )
+            .unwrap();
+        s.pin_set("1234").await.expect("PIN sets");
+        s.client = None;
+        s.secrets = None;
+
+        s.unlock(Unlock::Pin("1234")).await.expect("PIN unlocks");
+        assert!(s.unlocked());
+
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("client_id=user.1234"))
+            .and(body_string_contains("client_secret=api-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "api-access",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": "api"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .and(header("authorization", "Bearer api-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_sync_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        s.sync().await.expect("sync renews with the API key");
+        s.keep_tokens().await.unwrap();
+        assert_eq!(
+            s.tokens.load("device").and_then(|t| t.client_secret.clone()).as_deref(),
+            Some("api-secret")
+        );
+    }
+
+    #[test]
+    fn has_passkey_reflects_saved_prf_options() {
+        let mut s = Session::default();
+        assert!(!s.has_passkey());
+        s.saved = Some(Saved::default());
+        assert!(!s.has_passkey());
+        let opt = WebAuthnPrfUnlockOption {
+            credential_id: Some("cred".into()),
+            transports: None,
+            encrypted_private_key: "2.AAAA|BBBB|CCCC".parse().unwrap(),
+            encrypted_user_key: "4.AAAA".parse().unwrap(),
+        };
+        s.saved.as_mut().unwrap().prf_options = to_value(&vec![opt]).unwrap();
+        assert!(s.has_passkey());
     }
 }

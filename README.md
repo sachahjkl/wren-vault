@@ -120,13 +120,13 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | op | Request fields | Answer fields |
 |---|---|---|
 | `hello` | `protocol` (5), `state_dir` (string), `identity_url`, `api_url`, `persist` (bool), `device_name`, `client_version`, `idle_seconds` | `protocol`, `helper_version`, `account` (`"none"` or `"locked"`), `email`, `login` (`"password"` or `"api_key"`), `pin` (bool), `passkey` (bool: a passkey of the account unlocks) |
-| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked) with `pin` (bool: the account's PIN was kept, see "PIN"); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
-| `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email`, `pin` |
+| `login` | first step: `email`, `password`; second step: `email`, `code`, `provider`; a new code: `email`, `provider`, `resend` (true); `remember` (true): the server lets this device skip the second step next time | `result`: `"ok"` (unlocked) with `pin` (bool: the account's PIN was kept, see "PIN") and `passkey` (bool); or `"need_two_factor"` with `providers` and `email_sent`; or `"need_device_code"` |
+| `login_api_key` | `client_id` (`user.<uuid>`), `client_secret`, `password` (the master password) | `result` (`"ok"`), `email`, `pin`, `passkey` |
 | `unlock` | `password`, `pin`, `prf` and `credential_id` (a passkey), or `remembered` (true: the unlock the system's keyring keeps) | none; a `bad_pin` error carries `tries_left` |
 | `remember_unlock` | `mode`: `session` (until the computer restarts), `always` (across restarts) or `never` (forget it) | none; see "Remembered unlock" |
 | `lock` | none | none; the helper then exits |
 | `logout` | `keep_pin` (bool, default false: the session ended without the person asking) | none; the helper forgets the account (state, tokens, PIN; with `keep_pin`, all but the PIN and the account's names), then exits |
-| `sync` | none | `items` (count), `last_sync` (Unix seconds) |
+| `sync` | none | `items` (count), `last_sync` (Unix seconds), `passkey` (bool) |
 | `pin_set` | `pin` (4 characters or more) | none |
 | `pin_clear` | none | none |
 | `logins_for` | `url` (the document's address), `host`, `domain` (registrable domain, `""` if none) | `rows`: a list of `{id, name, username, uri, match, has_totp, kind}` (logins only: `kind` is `"login"`); `equivalent`: the domains that the account makes equivalent to `domain` |
@@ -137,9 +137,9 @@ request but `hello` needs a `hello` before it (`no_hello`).
 | `totp` | `item` | `totp` (the current code), `period` and `remaining` (seconds) |
 | `password_hint` | `email` | none; the server mails the hint to the account's address |
 | `device_request` | `email` | `fingerprint` (the phrase the other device shows) |
-| `device_poll` | none | `result`: `"pending"`, or `"ok"` (unlocked) with `email` |
+| `device_poll` | none | `result`: `"pending"`, or `"ok"` (unlocked) with `email`, `pin`, `passkey` |
 | `passkey_options` | `purpose` (`"login"` or `"unlock"`), `rp_id` (the web vault's domain) | `options` (the WebAuthn request's options, JSON text) |
-| `login_passkey` | `credential_id`, `authenticator_data`, `client_data_json`, `signature`, `user_handle` (each base64url), `prf` (the PRF output, base64url) | `result` (`"ok"`), `email` |
+| `login_passkey` | `credential_id`, `authenticator_data`, `client_data_json`, `signature`, `user_handle` (each base64url), `prf` (the PRF output, base64url) | `result` (`"ok"`), `email`, `pin`, `passkey` |
 | `passkeys_for` | `rp_id`, `allow` (credential ids, base64url; empty or absent: any passkey of `rp_id`) | `rows`: `{item, name, username, credential_id, user_handle}` (see "Passkeys of sites") |
 | `passkey_assert` | `item`, `credential_id`, `rp_id`, `client_data_hash` (base64url of the SHA-256 of the clientDataJSON) | `authenticator_data`, `signature`, `user_handle`, `credential_id` (each base64url) |
 | `keepalive` | none | no answer; the idle deadline starts again |
