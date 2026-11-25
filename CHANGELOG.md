@@ -8,6 +8,11 @@ moves the fragments here.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+- **Sessions stay open after unlocking with a PIN**: unlocking restores the login method after `initialize_user_crypto` (which clears `client_id`), so the sync that follows renews the access token instead of failing with `session_expired` and asking for the master password. Login and sync answers also report `passkey` so the browser keeps the passkey unlock option.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added
@@ -30,5 +35,6 @@ moves the fragments here.
 - **Logins refused for a missing client version**: every token request now carries the `Bitwarden-Client-Version` header, without which the server answers "No client version header found".
 - **Logging in with a password works**: the token request now carries the account's email in the `Auth-Email` header, which the Bitwarden server requires; without it, every password login was refused.
 
-[Unreleased]: https://github.com/sachahjkl/wren-vault/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sachahjkl/wren-vault/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/sachahjkl/wren-vault/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sachahjkl/wren-vault/releases/tag/v0.5.0
